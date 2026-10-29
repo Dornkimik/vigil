@@ -26,28 +26,43 @@ Each file gets a score. **35 or more is suspicious, 70 or more is malicious.** T
 shows every finding that added to the score.
 
 1. **Behavioral string rules** (`rules/default.rules`) look for combinations of indicators,
-   matched case-insensitively in ASCII and UTF-16 (so .NET stealers are covered):
+   matched case-insensitively in ASCII and UTF-16LE/BE (including .NET string literals):
    - Info-stealer behavior: browser credential and cookie stores, Discord tokens, crypto
      wallets, Telegram and Steam sessions, Discord webhook and Telegram bot exfiltration.
    - Loaders: PowerShell and LOLBin download cradles, Windows Script Host droppers,
      paste-site payloads, AutoIt.
    - Evasion: tampering with Defender or adding exclusions, UAC bypasses, sandbox and VM
      checks, killing security tools.
-   - Impact: deleting shadow copies (ransomware), crypto miners, known RAT families.
-2. **Executable structure**: process injection and hollowing imports, packers, high-entropy
+   - Impact: backup deletion paired with ransom demands, reverse-shell capability
+     combinations, and miners paired with security tampering.
+   - Credential dumping, keylogging with window context, and in-memory .NET loaders.
+   Required evidence groups distinguish capabilities: downloading alone is different
+   from downloading **and** executing. Independent combinations (credential collection
+   plus an exfiltration endpoint, or payload execution plus security tampering) add
+   corroboration points. Family names, AutoIt/PyInstaller packaging, and encoding alone
+   do not trigger alerts; ordinary mining configuration stays below the alert threshold.
+   These are static indicators of possible behavior, not proof that a command ran.
+2. **Static script recovery**: scripts (including `.py`/`.pyw`) and shortcut command text
+   are checked for nested Base64/UTF-16 payloads, Base64-wrapped gzip/zlib/Deflate streams,
+   adjacent quoted string concatenation, JavaScript/Python hex and Unicode escapes,
+   and selected PowerShell backtick/batch caret escapes. Nothing is executed. Recovered
+   evidence is labeled in findings and each rule scores only once across representations.
+   Recovery examines the first 2 MiB, at most three transformation levels and 16 views,
+   with separate 4 MiB budgets for recovered views and decoding/decompression work.
+3. **Executable structure**: process injection and hollowing imports, packers, high-entropy
    code, writable+executable sections, and files padded to hundreds of MB to dodge AV size
    limits.
-3. **Disguise tricks**: `invoice.pdf.exe`, right-to-left-override filenames, programs
+4. **Disguise tricks**: `invoice.pdf.exe`, right-to-left-override filenames, programs
    renamed to `.jpg`, extensions hidden behind padding spaces, shortcut (`.lnk`) droppers,
    ISO/IMG containers, macro-enabled Office files.
-4. **Archives**: password-protected ZIPs that hide programs (a classic way past scanners).
+5. **Archives**: password-protected ZIPs that hide programs (a classic way past scanners).
    Programs and scripts inside ZIPs are unpacked in memory and scanned.
-5. **Authenticode**: a valid signature removes 60% of the heuristic score. Broken or
+6. **Authenticode**: a valid signature removes 60% of the heuristic score. Broken or
    untrusted signatures add to it.
-6. **Hash reputation (optional)**: add a free [abuse.ch MalwareBazaar](https://auth.abuse.ch/)
+7. **Hash reputation (optional)**: add a free [abuse.ch MalwareBazaar](https://auth.abuse.ch/)
    key in Settings. Only SHA-256 hashes of unsigned files are sent. You can also put your own
    SHA-256 blocklist in `%LOCALAPPDATA%\Vigil\blocklist.txt`.
-7. **Defender cross-check**: the *Ask Defender* button sends a single file to
+8. **Defender cross-check**: the *Ask Defender* button sends a single file to
    `MpCmdRun.exe` for a second opinion. Defender does not remediate during this check.
 
 Malicious files are quarantined automatically (configurable). Suspicious files only trigger a
@@ -105,10 +120,40 @@ end
 
 The service reloads rules, the blocklist and settings within a few seconds of a change.
 
+For rules that need independent capabilities, add one `require` line per group.
+At least one alternative on **every** line must match, as well as the `min` threshold:
+
+```
+rule example.download_execute
+  desc   Downloads and evaluates a script
+  weight 35
+  scope  script
+  require DownloadString( | Invoke-WebRequest
+  require Invoke-Expression | IEX(
+end
+```
+
+Alternatives are separated by ` | ` (with spaces). Required patterns count toward
+`min`, which defaults to 1. Repeated patterns and repeated encodings do not increase
+the match count. Existing rules using only `str` and `min` remain supported.
+
+## Detection regression tests
+
+Run `cargo test --locked`. The fixtures are inert strings and in-memory archives;
+tests never execute payloads or contact malware hosts. They cover common capability
+combinations, encoded/compressed variants, decoder limits, and benign administration,
+browser, Steam, mining and web-asset examples. They do not establish a real-world
+detection rate or false-positive rate; that requires a representative labeled corpus.
+
+References: [Microsoft's EncodedCommand format](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_powershell_exe?view=powershell-5.1)
+and [MITRE ATT&CK obfuscation techniques](https://attack.mitre.org/techniques/T1027/).
+
 ## Limitations
 
-- Heuristics catch common, lazily built malware. Heavily obfuscated or encrypted payloads
-  can get through. Keep Defender's real-time protection and cloud protection on.
+- Static heuristics cannot determine intent or observe runtime behavior. Custom encryption,
+  runtime-built strings, arbitrary character-code expressions, native packers, and payloads
+  beyond the recovery limits can get through. Script recovery is not a complete language
+  parser or sandbox. Keep Defender's real-time protection and cloud protection on.
 - Only ZIP archives are unpacked. 7z and RAR archives are not, but their contents are
   scanned once extracted into a watched folder.
 - Quarantining a file from a Steam game breaks that game until you restore it, or until

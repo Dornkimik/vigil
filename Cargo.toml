@@ -10,6 +10,8 @@ build = "build.rs"
 eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow"] }
 notify = "8"
 aho-corasick = "1.1"
+base64 = "0.23"
+flate2 = "1"
 goblin = { version = "0.10", default-features = false, features = ["std", "pe32", "pe64"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 sha2 = "0.11"

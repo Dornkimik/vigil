@@ -34,7 +34,8 @@ pub fn analyze(data: &[u8]) -> Vec<Finding> {
     {
         findings.push(Finding::new("pe.injection", "Can inject code into other processes", 15));
     }
-    if any(&["ntunmapviewofsection", "zwunmapviewofsection"]) && any(&["setthreadcontext", "wow64setthreadcontext"]) && has("resumethread") {
+    if any(&["ntunmapviewofsection", "zwunmapviewofsection"]) && any(&["setthreadcontext", "wow64setthreadcontext"]) && has("resumethread")
+    {
         findings.push(Finding::new("pe.hollowing", "Process hollowing API combination", 30));
     }
     let mut max_entropy = 0.0f64;
@@ -60,7 +61,7 @@ pub fn analyze(data: &[u8]) -> Vec<Finding> {
         findings.push(Finding::new("pe.high_entropy", format!("Code is compressed or encrypted (entropy {max_entropy:.2})"), 10));
     }
     if !is_dotnet && !pe.is_lib && imports.len() < 3 {
-        findings.push(Finding::new("pe.few_imports", "Almost no imported functions (typical for packed loaders)", 10));
+        findings.push(Finding::new("pe.few_imports", "Almost no imported functions (typical for packed loaders)", 0));
     }
 
     findings
@@ -78,11 +79,7 @@ fn inflated(data: &[u8]) -> Option<Finding> {
     }
     let top = *counts.iter().max().unwrap();
     (top * 100 / tail.len() >= 99).then(|| {
-        Finding::new(
-            "pe.inflated",
-            format!("Padded with junk to {} MB (used to evade antivirus size limits)", data.len() >> 20),
-            40,
-        )
+        Finding::new("pe.inflated", format!("Padded with junk to {} MB (used to evade antivirus size limits)", data.len() >> 20), 10)
     })
 }
 

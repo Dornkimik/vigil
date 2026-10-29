@@ -30,14 +30,15 @@ impl Kind {
     }
 }
 
-pub const SCRIPT_EXTS: &[&str] = &["ps1", "psm1", "bat", "cmd", "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta", "reg"];
+pub const SCRIPT_EXTS: &[&str] = &["ps1", "psm1", "bat", "cmd", "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta", "reg", "py", "pyw"];
 const PE_EXTS: &[&str] = &["exe", "dll", "scr", "com", "cpl", "ocx", "sys", "asi", "xll", "pif", "drv", "efi", "mui"];
 /// Extensions that run when double-clicked (DLLs are excluded: names like Ionic.Zip.dll are normal).
-const LAUNCH_EXTS: &[&str] = &["exe", "scr", "com", "pif", "cpl", "bat", "cmd", "ps1", "js", "jse", "vbs", "vbe", "wsf", "hta", "lnk", "msi"];
+const LAUNCH_EXTS: &[&str] =
+    &["exe", "scr", "com", "pif", "cpl", "bat", "cmd", "ps1", "js", "jse", "vbs", "vbe", "wsf", "hta", "lnk", "msi"];
 /// Extensions a user expects to be harmless documents/media.
 const DECOY_EXTS: &[&str] = &[
-    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "rtf", "jpg", "jpeg", "png", "gif", "bmp", "webp", "mp3",
-    "mp4", "mkv", "avi", "mov", "wav", "zip", "rar", "7z",
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "txt", "rtf", "jpg", "jpeg", "png", "gif", "bmp", "webp", "mp3", "mp4", "mkv",
+    "avi", "mov", "wav", "zip", "rar", "7z",
 ];
 const RISKY_EXTS: &[&str] = &["scr", "pif", "cpl", "hta", "jse", "vbe", "wsf", "wsh", "js", "vbs"];
 /// Temporary files browsers write while a download is in progress.
@@ -132,18 +133,22 @@ pub fn script_findings(name: &str, data: &[u8]) -> Vec<Finding> {
         }
     }
     if longest >= 1500 {
-        f.push(Finding::new("script.encoded_blob", format!("Contains a large encoded blob ({longest} chars)"), 20));
+        f.push(Finding::new(
+            "script.encoded_blob",
+            format!("Contains a large encoded blob ({longest} chars); encoding alone is not malicious"),
+            0,
+        ));
     }
 
     let char_calls: usize = ["chr(", "chrw(", "fromcharcode", "[char]", "charcodeat"].iter().map(|p| text.matches(p).count()).sum();
     // Density matters: big minified libraries use these legitimately, droppers use little else.
     if char_calls > 25 && char_calls * 1024 / text.len().max(1) >= 2 {
-        f.push(Finding::new("script.char_obfuscation", "Builds strings character by character (obfuscation)", 20));
+        f.push(Finding::new("script.char_obfuscation", "Builds strings character by character (obfuscation alone is not malicious)", 0));
     }
 
     let ext = ext_of(name);
     if matches!(ext.as_str(), "bat" | "cmd") && text.matches('^').count() > 60 {
-        f.push(Finding::new("script.caret_obfuscation", "Batch file uses caret obfuscation", 20));
+        f.push(Finding::new("script.caret_obfuscation", "Batch file uses caret obfuscation", 0));
     }
     f
 }

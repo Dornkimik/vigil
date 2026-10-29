@@ -2409,9 +2409,11 @@ name = "vigil"
 version = "0.1.0"
 dependencies = [
  "aho-corasick",
+ "base64",
  "chrono",
  "dirs",
  "eframe",
+ "flate2",
  "goblin",
  "memmap2",
  "notify",

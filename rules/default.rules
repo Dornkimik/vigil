@@ -5,6 +5,7 @@
 #     desc   <human readable description>
 #     weight <points added to the file's score when the rule fires>
 #     min    <how many distinct `str` patterns must be present>
+#     require <pattern> | <alternative>  (each require line must have a hit)
 #     scope  any | pe | script | shortcut   (default: any)
 #     case   exact                          (optional: case-sensitive matching)
 #     str    <pattern>   (case-insensitive; also matched as UTF-16 and with
@@ -21,7 +22,7 @@
 
 rule stealer.browser_profiles
   desc   Enumerates profile folders of several different browsers
-  weight 30
+  weight 5
   min    3
   str    \Google\Chrome\User Data
   str    \BraveSoftware\Brave-Browser
@@ -37,8 +38,10 @@ end
 # these, so this rule alone stays below the suspicious threshold.
 rule stealer.browser_credentials
   desc   Reads browser password, cookie or autofill databases
-  weight 25
-  min    4
+  weight 20
+  min    3
+  require \Login Data | logins.json | cookies.sqlite
+  require encrypted_key | CryptUnprotectData | key4.db
   str    \Login Data
   str    \Local State
   str    encrypted_key
@@ -51,8 +54,10 @@ end
 
 rule stealer.discord_tokens
   desc   Hunts for Discord login tokens
-  weight 45
+  weight 25
   min    2
+  require dQw4w9WgXcQ: | discord.com/api/v9/users/@me
+  require \discord\Local Storage\leveldb | \Local Storage\leveldb
   str    dQw4w9WgXcQ:
   str    \discord\Local Storage\leveldb
   str    discordcanary
@@ -63,7 +68,7 @@ end
 
 rule stealer.crypto_wallets
   desc   Searches for cryptocurrency wallets and wallet extensions
-  weight 40
+  weight 20
   min    2
   str    wallet.dat
   str    \Exodus\exodus.wallet
@@ -80,7 +85,7 @@ end
 
 rule stealer.telegram_session
   desc   Copies Telegram Desktop session data
-  weight 40
+  weight 20
   min    1
   str    \Telegram Desktop\tdata
   str    D877F783D5D3EF8C
@@ -88,7 +93,7 @@ end
 
 rule stealer.steam_session
   desc   Reads Steam login/session files
-  weight 35
+  weight 20
   min    2
   str    loginusers.vdf
   str    \Steam\config\
@@ -98,7 +103,7 @@ end
 
 rule stealer.exfil_channel
   desc   Contains a Discord webhook or Telegram bot endpoint (common exfiltration channels)
-  weight 25
+  weight 20
   min    1
   str    discord.com/api/webhooks/
   str    discordapp.com/api/webhooks/
@@ -107,7 +112,7 @@ end
 
 rule stealer.recon
   desc   Looks up the machine's public IP / geolocation
-  weight 10
+  weight 0
   min    1
   str    ip-api.com/json
   str    ipinfo.io/json
@@ -119,7 +124,7 @@ end
 
 rule stealer.family_names
   desc   Contains names of well-known info-stealer families
-  weight 20
+  weight 0
   min    1
   case   exact
   str    LummaC2
@@ -137,6 +142,8 @@ rule loader.download_cradle
   desc   Downloads and executes code (PowerShell / LOLBin download cradle)
   weight 35
   min    2
+  require DownloadString | DownloadData | Invoke-WebRequest | requests.get( | urlopen( | curl http | curl.exe http
+  require Invoke-Expression | IEX( | IEX ( | IEX $ | 'IEX' | "IEX" | | IEX | exec( | eval( | ScriptBlock]::Create
   str    DownloadString(
   str    DownloadFile(
   str    DownloadData(
@@ -163,6 +170,9 @@ rule loader.script_dropper
   weight 35
   min    3
   scope  script
+  require MSXML2.XMLHTTP | MSXML2.ServerXMLHTTP | WinHttp.WinHttpRequest
+  require ADODB.Stream | Scripting.FileSystemObject
+  require .Run( | .Run ( | .Run " | .Exec( | ShellExecute
   str    WScript.Shell
   str    ActiveXObject
   str    Scripting.FileSystemObject
@@ -176,7 +186,7 @@ end
 
 rule loader.paste_hosts
   desc   References paste/anonymous file hosts often used to stage payloads
-  weight 15
+  weight 0
   min    1
   str    pastebin.com/raw
   str    paste.ee/r/
@@ -188,7 +198,7 @@ end
 
 rule loader.autoit
   desc   Compiled AutoIt script (heavily abused by malware loaders)
-  weight 25
+  weight 0
   min    1
   scope  pe
   str    AU3!EA06
@@ -196,7 +206,7 @@ end
 
 rule loader.pyinstaller
   desc   PyInstaller-packed Python program (common for stealers, also legit tools)
-  weight 5
+  weight 0
   min    2
   scope  pe
   str    _MEIPASS
@@ -208,29 +218,25 @@ end
 
 rule evasion.defender_tamper
   desc   Tries to disable or add exclusions to Microsoft Defender
-  weight 60
+  weight 25
   min    1
-  str    Add-MpPreference -ExclusionPath
-  str    Add-MpPreference -ExclusionProcess
-  str    Add-MpPreference -ExclusionExtension
-  str    Set-MpPreference -DisableRealtimeMonitoring
-  str    DisableRealtimeMonitoring $true
-  str    DisableAntiSpyware
-  str    \Windows Defender\Exclusions\Paths
-  str    -ExclusionPath
+  require Add-MpPreference | Set-MpPreference
+  require -ExclusionPath | -ExclusionProcess | -ExclusionExtension | -DisableRealtimeMonitoring $true | -DisableRealtimeMonitoring 1
 end
 
 rule evasion.uac_bypass
   desc   Known UAC bypass via auto-elevating Windows binaries
-  weight 45
+  weight 35
   min    1
+  require DelegateExecute | fodhelper.exe | eventvwr.exe | computerdefaults.exe
+  require ms-settings\Shell\Open\command | mscfile\shell\open\command
   str    ms-settings\Shell\Open\command
   str    mscfile\shell\open\command
 end
 
 rule evasion.anti_analysis
   desc   Checks for virtual machines, sandboxes or analysis tools
-  weight 25
+  weight 10
   min    4
   str    VBoxService
   str    VBoxTray
@@ -251,8 +257,10 @@ end
 
 rule evasion.kill_security_tools
   desc   Terminates security software processes
-  weight 40
+  weight 25
   min    2
+  require taskkill /f /im | taskkill.exe /f /im | Stop-Process
+  require MsMpEng.exe | avp.exe | MBAMService | bdagent.exe | ekrn.exe
   str    MsMpEng.exe
   str    taskkill /f /im
   str    avp.exe
@@ -264,22 +272,29 @@ end
 # ---------------------------------------------------------------- impact
 
 rule impact.ransomware
-  desc   Deletes backups/shadow copies or contains a ransom note
-  weight 60
+  desc   Contains a command to delete backups or disable recovery
+  weight 20
   min    1
   str    vssadmin delete shadows
   str    vssadmin.exe delete shadows
   str    wmic shadowcopy delete
   str    wbadmin delete catalog
   str    recoveryenabled no
-  str    your files have been encrypted
-  str    all your files are encrypted
+end
+
+rule impact.ransom_note
+  desc   Contains ransom-demand wording
+  weight 20
+  require your files have been encrypted | all your files are encrypted
+  require bitcoin | monero | decrypt | ransom
 end
 
 rule impact.cryptominer
   desc   Embedded cryptocurrency miner
-  weight 50
+  weight 15
   min    1
+  require stratum+tcp:// | stratum+ssl://
+  require --donate-level | xmrig | cryptonight | randomx
   str    stratum+tcp://
   str    stratum+ssl://
   str    --donate-level
@@ -289,7 +304,7 @@ end
 
 rule impact.remote_access
   desc   Contains names of well-known remote-access trojans
-  weight 30
+  weight 0
   min    1
   case   exact
   str    AsyncRAT
@@ -298,6 +313,60 @@ rule impact.remote_access
   str    DcRat
   str    Remcos
   str    XWorm
+end
+
+# Capability combinations, rather than individual API/tool names.
+rule loader.memory_payload
+  desc   Decodes a payload and loads it as an in-memory assembly
+  weight 35
+  scope  script
+  require FromBase64String | DownloadData( | DownloadString(
+  require [Reflection.Assembly]::Load( | [System.Reflection.Assembly]::Load(
+  require .EntryPoint.Invoke( | .GetMethod(
+end
+
+rule evasion.amsi_tamper
+  desc   Accesses AMSI internals to disable script scanning
+  weight 35
+  scope  script
+  require AmsiUtils | AmsiScanBuffer
+  require amsiInitFailed | VirtualProtect
+  require SetValue( | Marshal]::Copy | Marshal.Copy
+end
+
+rule stealer.credential_dump
+  desc   Contains credential-dumping command combinations
+  weight 40
+  require sekurlsa::logonpasswords | sekurlsa::ekeys | lsadump::sam | lsadump::dcsync
+  require privilege::debug | token::elevate | /system: | /user:
+end
+
+rule stealer.keylogger
+  desc   Captures keystrokes together with foreground-window context
+  weight 25
+  scope  script
+  require GetAsyncKeyState | SetWindowsHookEx | pynput.keyboard.Listener
+  require GetForegroundWindow | GetWindowText
+  require WriteAllText | AppendAllText | WriteFile | sendmail( | UploadString(
+end
+
+rule impact.reverse_shell
+  desc   Script combines a TCP command channel, command execution and a response stream
+  weight 55
+  scope  script
+  require Net.Sockets.TCPClient | socket.socket(
+  require GetStream( | .recv(
+  require Invoke-Expression | IEX( | IEX $ | subprocess.Popen( | os.popen(
+  require .Write( | .send( | .sendall(
+end
+
+rule impact.miner_evasion
+  desc   Mining endpoint combined with Defender exclusion changes
+  weight 35
+  scope  script
+  require stratum+tcp:// | stratum+ssl://
+  require Add-MpPreference | Set-MpPreference
+  require -ExclusionPath | -ExclusionProcess
 end
 
 # ---------------------------------------------------------------- persistence (weak alone)
@@ -328,7 +397,7 @@ end
 
 rule shortcut.launches_interpreter
   desc   Shortcut launches a script interpreter (classic LNK dropper)
-  weight 45
+  weight 10
   min    1
   scope  shortcut
   str    powershell

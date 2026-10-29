@@ -2,9 +2,12 @@
 //! and turns everything into a scored [`Report`].
 
 pub mod archive;
+mod deobfuscate;
 pub mod filetype;
 pub mod pe;
 pub mod rules;
+#[cfg(test)]
+mod tests;
 
 use crate::config::{self, Config};
 use crate::winapi::{self, InvalidReason, Signature};
@@ -283,12 +286,20 @@ impl Engine {
             _ => None,
         };
         if let Some(scope) = scope {
-            for m in self.rules.scan(data, scope) {
+            let views = match kind {
+                Kind::Script => deobfuscate::views(name, data),
+                Kind::Shortcut => deobfuscate::views("shortcut.lnk", data),
+                _ => Vec::new(),
+            };
+            let matches = if views.is_empty() { self.rules.scan(data, scope) } else { self.rules.scan_views(data, &views, scope) };
+            for m in matches {
                 let shown: Vec<&str> = m.matched.iter().take(4).copied().collect();
                 let more = if m.matched.len() > 4 { format!(" +{} more", m.matched.len() - 4) } else { String::new() };
-                let title = format!("{} [{}{more}]", m.rule.desc, shown.join(", "));
+                let recovered = if m.decoded { " (recovered from encoded/obfuscated text)" } else { "" };
+                let title = format!("{}{recovered} [{}{more}]", m.rule.desc, shown.join(", "));
                 findings.push(Finding::new(format!("rule.{}", m.rule.id), title, m.rule.weight));
             }
+            correlate(&mut findings);
         }
         match kind {
             Kind::Pe => findings.extend(pe::analyze(data)),
@@ -324,6 +335,29 @@ impl Engine {
         };
         self.mb_cache.lock().unwrap().insert(sha256.to_string(), result.clone());
         result
+    }
+}
+
+/// Independent capabilities corroborate one another. A filename, packer,
+/// encoding scheme or family name never earns a behavioral correlation bonus.
+fn correlate(findings: &mut Vec<Finding>) {
+    let has = |id: &str| findings.iter().any(|f| f.id == id);
+    let theft =
+        ["browser_credentials", "discord_tokens", "crypto_wallets", "telegram_session", "steam_session", "keylogger", "credential_dump"]
+            .iter()
+            .any(|id| has(&format!("rule.stealer.{id}")));
+    let exfil = has("rule.stealer.exfil_channel");
+    let loader = has("rule.loader.download_cradle") || has("rule.loader.script_dropper") || has("rule.loader.memory_payload");
+    let tamper = has("rule.evasion.defender_tamper") || has("rule.evasion.amsi_tamper");
+    let ransom = has("rule.impact.ransomware") && has("rule.impact.ransom_note");
+    if theft && exfil {
+        findings.push(Finding::new("behavior.theft_exfil", "Credential/session collection combined with an exfiltration endpoint", 30));
+    }
+    if loader && tamper {
+        findings.push(Finding::new("behavior.loader_evasion", "Payload execution combined with security tampering", 25));
+    }
+    if ransom {
+        findings.push(Finding::new("behavior.ransomware", "Backup destruction combined with a ransom demand", 35));
     }
 }
 
