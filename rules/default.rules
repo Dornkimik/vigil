@@ -1,0 +1,346 @@
+# Vigil default heuristic rules
+#
+# Format:
+#   rule <id>
+#     desc   <human readable description>
+#     weight <points added to the file's score when the rule fires>
+#     min    <how many distinct `str` patterns must be present>
+#     scope  any | pe | script | shortcut   (default: any)
+#     case   exact                          (optional: case-sensitive matching)
+#     str    <pattern>   (case-insensitive; also matched as UTF-16 and with
+#                         doubled backslashes, so .NET and script sources hit too)
+#   end
+#
+# Score thresholds: >= 35 suspicious, >= 70 malicious. A valid Authenticode
+# signature removes 60% of the heuristic score. Keep weights conservative: these rules
+# run on every Steam game DLL, so single generic strings must never convict.
+#
+# Users can add their own rules in %LOCALAPPDATA%\Vigil\custom.rules.
+
+# ---------------------------------------------------------------- info stealers
+
+rule stealer.browser_profiles
+  desc   Enumerates profile folders of several different browsers
+  weight 30
+  min    3
+  str    \Google\Chrome\User Data
+  str    \BraveSoftware\Brave-Browser
+  str    \Microsoft\Edge\User Data
+  str    \Opera Software\Opera
+  str    \Yandex\YandexBrowser
+  str    \Vivaldi\User Data
+  str    \Mozilla\Firefox\Profiles
+  str    \Chromium\User Data
+end
+
+# Chromium-embedding binaries (libcef.dll etc.) legitimately contain some of
+# these, so this rule alone stays below the suspicious threshold.
+rule stealer.browser_credentials
+  desc   Reads browser password, cookie or autofill databases
+  weight 25
+  min    4
+  str    \Login Data
+  str    \Local State
+  str    encrypted_key
+  str    \Web Data
+  str    logins.json
+  str    key4.db
+  str    cookies.sqlite
+  str    CryptUnprotectData
+end
+
+rule stealer.discord_tokens
+  desc   Hunts for Discord login tokens
+  weight 45
+  min    2
+  str    dQw4w9WgXcQ:
+  str    \discord\Local Storage\leveldb
+  str    discordcanary
+  str    discordptb
+  str    \Local Storage\leveldb
+  str    discord.com/api/v9/users/@me
+end
+
+rule stealer.crypto_wallets
+  desc   Searches for cryptocurrency wallets and wallet extensions
+  weight 40
+  min    2
+  str    wallet.dat
+  str    \Exodus\exodus.wallet
+  str    \Electrum\wallets
+  str    \atomic\Local Storage
+  str    \Ethereum\keystore
+  str    \Coinomi\Coinomi\wallets
+  str    nkbihfbeogaeaoehlefnkodbefgpgknn
+  str    bfnaelmomeimhlpmgjnjophhpkkoljpa
+  str    hnfanknocfeofbddgcijnmhnfnkdnaad
+  str    fhbohimaelbohpjbbldcngcnapndodjp
+  str    ibnejdfjmmkpcnlpebklmnkoeoihofec
+end
+
+rule stealer.telegram_session
+  desc   Copies Telegram Desktop session data
+  weight 40
+  min    1
+  str    \Telegram Desktop\tdata
+  str    D877F783D5D3EF8C
+end
+
+rule stealer.steam_session
+  desc   Reads Steam login/session files
+  weight 35
+  min    2
+  str    loginusers.vdf
+  str    \Steam\config\
+  str    config\config.vdf
+  str    Steam\ssfn
+end
+
+rule stealer.exfil_channel
+  desc   Contains a Discord webhook or Telegram bot endpoint (common exfiltration channels)
+  weight 25
+  min    1
+  str    discord.com/api/webhooks/
+  str    discordapp.com/api/webhooks/
+  str    api.telegram.org/bot
+end
+
+rule stealer.recon
+  desc   Looks up the machine's public IP / geolocation
+  weight 10
+  min    1
+  str    ip-api.com/json
+  str    ipinfo.io/json
+  str    api.ipify.org
+  str    icanhazip.com
+  str    checkip.amazonaws.com
+  str    geolocation-db.com
+end
+
+rule stealer.family_names
+  desc   Contains names of well-known info-stealer families
+  weight 20
+  min    1
+  case   exact
+  str    LummaC2
+  str    RedLine Stealer
+  str    Vidar Stealer
+  str    Raccoon Stealer
+  str    Epsilon Stealer
+  str    BlankGrabber
+  str    Luna Grabber
+end
+
+# ---------------------------------------------------------------- loaders / droppers
+
+rule loader.download_cradle
+  desc   Downloads and executes code (PowerShell / LOLBin download cradle)
+  weight 35
+  min    2
+  str    DownloadString(
+  str    DownloadFile(
+  str    DownloadData(
+  str    New-Object Net.WebClient
+  str    New-Object System.Net.WebClient
+  str    Invoke-Expression
+  str    IEX(
+  str    IEX (
+  str    -EncodedCommand
+  str    [Convert]::FromBase64String
+  str    -WindowStyle Hidden
+  str    -w hidden
+  str    Invoke-WebRequest
+  str    bitsadmin /transfer
+  str    certutil -urlcache
+  str    certutil.exe -urlcache
+  str    certutil -decode
+  str    mshta http
+  str    Start-BitsTransfer
+end
+
+rule loader.script_dropper
+  desc   Windows Script Host dropper pattern (shell + HTTP + file write)
+  weight 35
+  min    3
+  scope  script
+  str    WScript.Shell
+  str    ActiveXObject
+  str    Scripting.FileSystemObject
+  str    MSXML2.XMLHTTP
+  str    MSXML2.ServerXMLHTTP
+  str    WinHttp.WinHttpRequest
+  str    ADODB.Stream
+  str    Shell.Application
+  str    WScript.CreateObject
+end
+
+rule loader.paste_hosts
+  desc   References paste/anonymous file hosts often used to stage payloads
+  weight 15
+  min    1
+  str    pastebin.com/raw
+  str    paste.ee/r/
+  str    rentry.co/
+  str    transfer.sh/
+  str    gofile.io/d
+  str    files.catbox.moe
+end
+
+rule loader.autoit
+  desc   Compiled AutoIt script (heavily abused by malware loaders)
+  weight 25
+  min    1
+  scope  pe
+  str    AU3!EA06
+end
+
+rule loader.pyinstaller
+  desc   PyInstaller-packed Python program (common for stealers, also legit tools)
+  weight 5
+  min    2
+  scope  pe
+  str    _MEIPASS
+  str    pyi-runtime-tmpdir
+  str    PyInstaller
+end
+
+# ---------------------------------------------------------------- defense evasion
+
+rule evasion.defender_tamper
+  desc   Tries to disable or add exclusions to Microsoft Defender
+  weight 60
+  min    1
+  str    Add-MpPreference -ExclusionPath
+  str    Add-MpPreference -ExclusionProcess
+  str    Add-MpPreference -ExclusionExtension
+  str    Set-MpPreference -DisableRealtimeMonitoring
+  str    DisableRealtimeMonitoring $true
+  str    DisableAntiSpyware
+  str    \Windows Defender\Exclusions\Paths
+  str    -ExclusionPath
+end
+
+rule evasion.uac_bypass
+  desc   Known UAC bypass via auto-elevating Windows binaries
+  weight 45
+  min    1
+  str    ms-settings\Shell\Open\command
+  str    mscfile\shell\open\command
+end
+
+rule evasion.anti_analysis
+  desc   Checks for virtual machines, sandboxes or analysis tools
+  weight 25
+  min    4
+  str    VBoxService
+  str    VBoxTray
+  str    vmtoolsd
+  str    vmwaretray
+  str    SbieDll.dll
+  str    wireshark
+  str    x64dbg
+  str    ollydbg
+  str    ProcessHacker
+  str    HTTPDebuggerUI
+  str    fiddler
+  str    dnSpy
+  str    cuckoo
+  str    VMware Virtual Platform
+  str    qemu-ga
+end
+
+rule evasion.kill_security_tools
+  desc   Terminates security software processes
+  weight 40
+  min    2
+  str    MsMpEng.exe
+  str    taskkill /f /im
+  str    avp.exe
+  str    MBAMService
+  str    bdagent.exe
+  str    ekrn.exe
+end
+
+# ---------------------------------------------------------------- impact
+
+rule impact.ransomware
+  desc   Deletes backups/shadow copies or contains a ransom note
+  weight 60
+  min    1
+  str    vssadmin delete shadows
+  str    vssadmin.exe delete shadows
+  str    wmic shadowcopy delete
+  str    wbadmin delete catalog
+  str    recoveryenabled no
+  str    your files have been encrypted
+  str    all your files are encrypted
+end
+
+rule impact.cryptominer
+  desc   Embedded cryptocurrency miner
+  weight 50
+  min    1
+  str    stratum+tcp://
+  str    stratum+ssl://
+  str    --donate-level
+  str    xmrig
+  str    cryptonight
+end
+
+rule impact.remote_access
+  desc   Contains names of well-known remote-access trojans
+  weight 30
+  min    1
+  case   exact
+  str    AsyncRAT
+  str    njRAT
+  str    Quasar.Client
+  str    DcRat
+  str    Remcos
+  str    XWorm
+end
+
+# ---------------------------------------------------------------- persistence (weak alone)
+
+rule persistence.autorun
+  desc   Installs itself to start automatically
+  weight 10
+  min    1
+  str    \CurrentVersion\Run
+  str    schtasks /create
+  str    schtasks.exe /create
+  str    \Start Menu\Programs\Startup
+  str    Register-ScheduledTask
+end
+
+rule persistence.hidden_copy
+  desc   Copies itself into a hidden/system-looking location
+  weight 15
+  min    2
+  str    attrib +h +s
+  str    attrib +s +h
+  str    \AppData\Roaming\Microsoft\Windows\svchost.exe
+  str    \AppData\Local\Temp\svchost.exe
+  str    Copy-Item $PSCommandPath
+end
+
+# ---------------------------------------------------------------- shortcuts
+
+rule shortcut.launches_interpreter
+  desc   Shortcut launches a script interpreter (classic LNK dropper)
+  weight 45
+  min    1
+  scope  shortcut
+  str    powershell
+  str    pwsh
+  str    cmd.exe
+  str    mshta
+  str    wscript
+  str    cscript
+  str    rundll32
+  str    regsvr32
+  str    conhost
+  str    certutil
+  str    bitsadmin
+  str    curl
+end
