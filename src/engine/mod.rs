@@ -4,6 +4,7 @@
 pub mod archive;
 mod deobfuscate;
 pub mod filetype;
+pub mod hashdb;
 pub mod pe;
 pub mod rules;
 #[cfg(test)]
@@ -132,6 +133,7 @@ pub struct Engine {
     rule_errors: Vec<String>,
     blocklist: HashSet<String>,
     allowlist: HashSet<String>,
+    hashdb: Option<hashdb::HashDb>,
     mb_key: String,
     mb_cache: Mutex<HashMap<String, Option<String>>>,
     agent: ureq::Agent,
@@ -153,6 +155,7 @@ impl Engine {
             rule_errors,
             blocklist,
             allowlist: cfg.allowlist.iter().map(|h| h.to_ascii_lowercase()).collect(),
+            hashdb: hashdb::HashDb::open_current(),
             mb_key: cfg.malwarebazaar_key.trim().to_string(),
             mb_cache: Mutex::new(HashMap::new()),
             agent,
@@ -165,6 +168,15 @@ impl Engine {
 
     pub fn rule_errors(&self) -> &[String] {
         &self.rule_errors
+    }
+
+    /// Local known-bad checks: the user's blocklist and the offline MalwareBazaar database.
+    pub(crate) fn known_hash(&self, sha256: &str) -> Option<Finding> {
+        if self.blocklist.contains(sha256) {
+            return Some(Finding::new("hash.blocklist", "Hash is on your local blocklist", 100));
+        }
+        let family = self.hashdb.as_ref()?.lookup(&hashdb::parse_sha256(sha256)?)?;
+        Some(malwarebazaar_finding(family))
     }
 
     /// Scans one file. I/O errors (e.g. the file is still locked by the browser)
@@ -222,9 +234,7 @@ impl Engine {
                 r.findings.push(Finding::new("allowlist", "You marked this file as safe", 0));
                 return Ok(r);
             }
-            if self.blocklist.contains(h) {
-                findings.push(Finding::new("hash.blocklist", "Hash is on your local blocklist", 100));
-            }
+            findings.extend(self.known_hash(h));
         }
 
         if let Some(m) = &map {
@@ -252,13 +262,17 @@ impl Engine {
             }
         }
 
-        if r.signer.is_none() {
-            if let Some(family) = r.sha256.as_deref().and_then(|h| self.reputation(h)) {
-                findings.push(Finding::new("hash.malwarebazaar", format!("Known malware on MalwareBazaar: {family}"), 100));
-            }
+        let mut known_bad = findings.iter().any(|f| f.id.starts_with("hash."));
+        // Online lookups only bridge the gap until the offline database has been downloaded.
+        if r.signer.is_none()
+            && !known_bad
+            && self.hashdb.is_none()
+            && let Some(family) = r.sha256.as_deref().and_then(|h| self.reputation(h))
+        {
+            findings.push(malwarebazaar_finding(&family));
+            known_bad = true;
         }
 
-        let known_bad = findings.iter().any(|f| f.id.starts_with("hash."));
         let mut score: i32 = findings.iter().map(|f| f.weight).sum();
         if let Some(signer) = &r.signer {
             // A valid signature from a real publisher removes most heuristic suspicion
@@ -329,13 +343,18 @@ impl Engine {
             .ok()?;
         let v: serde_json::Value = serde_json::from_str(&body).ok()?;
         let result = match v["query_status"].as_str()? {
-            "ok" => Some(v["data"][0]["signature"].as_str().unwrap_or("unnamed sample").to_string()),
+            "ok" => Some(v["data"][0]["signature"].as_str().unwrap_or("").to_string()),
             "hash_not_found" => None,
             _ => return None, // auth/rate-limit errors: don't cache
         };
         self.mb_cache.lock().unwrap().insert(sha256.to_string(), result.clone());
         result
     }
+}
+
+fn malwarebazaar_finding(family: &str) -> Finding {
+    let family = if family.is_empty() { "unnamed sample" } else { family };
+    Finding::new("hash.malwarebazaar", format!("Known malware on MalwareBazaar: {family}"), 100)
 }
 
 /// Independent capabilities corroborate one another. A filename, packer,

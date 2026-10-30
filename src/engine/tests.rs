@@ -10,6 +10,7 @@ fn engine() -> Engine {
         rule_errors,
         blocklist: HashSet::new(),
         allowlist: HashSet::new(),
+        hashdb: None,
         mb_key: String::new(),
         mb_cache: Mutex::new(HashMap::new()),
         agent: ureq::Agent::new_with_defaults(),
@@ -128,4 +129,86 @@ fn zip_members_use_the_same_decoding_and_scoring() {
     let (score, findings) = engine().analyze_buffer("delivery.zip", &data, Kind::Zip, 0);
     assert!(score >= MALICIOUS, "{findings:?}");
     assert!(findings.iter().any(|f| f.title.contains("payload.ps1") && f.title.contains("recovered from")));
+}
+
+/// Unique scratch path for a database file built by a test.
+fn temp_db(name: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("vigil-test-{}-{name}.bin", std::process::id()))
+}
+
+#[test]
+fn malwarebazaar_csv_imports_into_a_searchable_database() {
+    let named = "a".repeat(64);
+    let unnamed = "B".repeat(64);
+    let csv = format!(
+        "################################\n\
+         # MalwareBazaar recent additions\n\
+         # \"first_seen_utc\",\"sha256_hash\",\"md5_hash\",\"sha1_hash\",\"reporter\",\"file_name\",\"file_type_guess\",\"mime_type\",\"signature\",\"clamav\"\n\
+         \"2026-10-30 10:00:00\", \"{named}\", \"{md5}\", \"{sha1}\", \"r\", \"a, \"\"quoted\"\" name.exe\", \"exe\", \"application/x-dosexec\", \"RedLineStealer\", \"n/a\"\n\
+         \"2026-10-30 10:01:00\", \"{unnamed}\", \"{md5}\", \"{sha1}\", \"r\", \"b.exe\", \"exe\", \"application/x-dosexec\", \"n/a\", \"n/a\"\n\
+         \"2026-10-30 10:02:00\", \"{unnamed}\", \"{md5}\", \"{sha1}\", \"r\", \"b.exe\", \"exe\", \"application/x-dosexec\", \"AgentTesla\", \"n/a\"\n\
+         \"2026-10-30 10:03:00\", \"not-a-hash\", \"{md5}\"\n",
+        md5 = "c".repeat(32),
+        sha1 = "d".repeat(40),
+    );
+    let mut b = hashdb::Builder::new();
+    assert_eq!(hashdb::import_csv(csv.as_bytes(), &mut b).unwrap(), 3);
+    let path = temp_db("csv");
+    assert_eq!(b.write(&path).unwrap(), 2);
+    let db = hashdb::HashDb::open(&path).unwrap();
+    assert_eq!(db.len(), 2);
+    assert_eq!(db.lookup(&hashdb::parse_sha256(&named).unwrap()), Some("RedLineStealer"));
+    // A named duplicate fills in the family of an earlier unnamed row.
+    assert_eq!(db.lookup(&hashdb::parse_sha256(&unnamed).unwrap()), Some("AgentTesla"));
+    assert_eq!(db.lookup(&[0x11; 32]), None);
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn headerless_csv_falls_back_to_the_first_sha256_field() {
+    let hash = "0123456789abcdef".repeat(4);
+    let mut b = hashdb::Builder::new();
+    let csv = format!("{},{},{hash},x\n", "e".repeat(32), "f".repeat(40));
+    assert_eq!(hashdb::import_csv(csv.as_bytes(), &mut b).unwrap(), 1);
+    let path = temp_db("headerless");
+    b.write(&path).unwrap();
+    let db = hashdb::HashDb::open(&path).unwrap();
+    assert_eq!(db.lookup(&hashdb::parse_sha256(&hash).unwrap()), Some(""));
+    drop(db);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn known_hashes_are_found_in_files_and_inside_zips() {
+    use std::io::{Cursor, Write};
+    let member = b"MZ inert fixture bytes";
+    let mut b = hashdb::Builder::new();
+    b.add(Sha256::digest(member).into(), "TestFamily");
+    let path = temp_db("engine");
+    b.write(&path).unwrap();
+    let mut engine = engine();
+    engine.hashdb = Some(hashdb::HashDb::open(&path).unwrap());
+
+    let hit = engine.known_hash(&hex(&Sha256::digest(member))).unwrap();
+    assert_eq!(hit.id, "hash.malwarebazaar");
+    assert!(hit.title.contains("TestFamily"));
+
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    zip.start_file("tool.exe", zip::write::SimpleFileOptions::default()).unwrap();
+    zip.write_all(member).unwrap();
+    let data = zip.finish().unwrap().into_inner();
+    let (score, findings) = engine.analyze_buffer("delivery.zip", &data, Kind::Zip, 0);
+    assert!(score >= MALICIOUS, "{findings:?}");
+    assert!(findings.iter().any(|f| f.id == "hash.malwarebazaar" && f.title.contains("tool.exe")));
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn corrupt_database_files_are_rejected() {
+    let path = temp_db("corrupt");
+    std::fs::write(&path, b"VIGILHD1\xff\xff\xff\xff\xff\xff\xff\xff\0\0\0\0\0\0\0\0").unwrap();
+    assert!(hashdb::HashDb::open(&path).is_err());
+    let _ = std::fs::remove_file(path);
 }

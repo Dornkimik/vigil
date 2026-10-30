@@ -30,6 +30,9 @@ pub fn custom_rules_path() -> PathBuf {
 pub fn blocklist_path() -> PathBuf {
     data_dir().join("blocklist.txt")
 }
+pub fn hashdb_meta_path() -> PathBuf {
+    data_dir().join("hashdb.json")
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -42,7 +45,7 @@ pub struct Config {
     pub notify_suspicious: bool,
     pub notifications: bool,
     pub paused: bool,
-    /// Optional abuse.ch MalwareBazaar Auth-Key for hash reputation lookups.
+    /// Optional abuse.ch MalwareBazaar Auth-Key, used to download the offline hash database.
     pub malwarebazaar_key: String,
     /// SHA-256 hashes the user marked as safe.
     pub allowlist: Vec<String>,
@@ -77,12 +80,13 @@ impl Config {
     }
 
     /// Re-reads the config from disk, applies `f` and saves it. The daemon and GUI
-    /// both write the config, so always mutate the freshest copy.
-    pub fn update(f: impl FnOnce(&mut Config)) -> Config {
+    /// both write the config, so always mutate the freshest copy. The updated config
+    /// is returned even when saving fails, together with the save result.
+    pub fn update(f: impl FnOnce(&mut Config)) -> (Config, std::io::Result<()>) {
         let mut c = Self::load();
         f(&mut c);
-        let _ = c.save();
-        c
+        let saved = c.save();
+        (c, saved)
     }
 
     pub fn is_allowed(&self, sha256: &str) -> bool {

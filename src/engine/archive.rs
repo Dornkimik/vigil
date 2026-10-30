@@ -2,6 +2,7 @@
 
 use super::filetype::{self, Kind};
 use super::{Engine, Finding};
+use sha2::{Digest, Sha256};
 use std::io::{Cursor, Read};
 
 const MAX_ENTRIES: usize = 5000;
@@ -51,12 +52,17 @@ pub fn analyze(engine: &Engine, data: &[u8], depth: u32) -> Vec<Finding> {
         if entry.take(MAX_INNER_SIZE).read_to_end(&mut buf).is_err() {
             continue;
         }
+        let known = engine.known_hash(&super::hex(&Sha256::digest(&buf)));
         let kind = filetype::classify(&base, &buf[..buf.len().min(512)]);
-        if kind == Kind::Other {
+        if kind == Kind::Other && known.is_none() {
             continue;
         }
         inspected += 1;
-        let (score, inner) = engine.analyze_buffer(&base, &buf, kind, depth + 1);
+        let (mut score, mut inner) = if kind == Kind::Other { (0, Vec::new()) } else { engine.analyze_buffer(&base, &buf, kind, depth + 1) };
+        if let Some(f) = known {
+            score += f.weight;
+            inner.insert(0, f);
+        }
         if worst.as_ref().is_none_or(|w| score > w.1) {
             worst = Some((base, score, inner));
         }

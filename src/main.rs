@@ -7,6 +7,7 @@
 //!   vigil.exe --gui           open only the dashboard
 //!   vigil.exe --scan <paths>  scan from the command line [--json] [--fast] [--out <file>]
 //!                             (--fast only opens code-like extensions, as for Steam folders)
+//!   vigil.exe --update-hashes download the MalwareBazaar hash database now
 
 mod config;
 mod daemon;
@@ -26,6 +27,7 @@ fn main() {
         Some("--background") => daemon::run(false),
         Some("--gui") => gui::run(),
         Some("--scan") => std::process::exit(cli_scan(&args[1..])),
+        Some("--update-hashes") => std::process::exit(cli_update_hashes()),
         _ if winapi::NamedMutex::exists(daemon::DAEMON_MUTEX) => gui::run(),
         _ => daemon::run(true),
     }
@@ -51,6 +53,23 @@ pub fn walk_files(root: &Path, f: &mut dyn FnMut(&Path) -> bool) -> bool {
         }
     }
     true
+}
+
+fn cli_update_hashes() -> i32 {
+    winapi::attach_parent_console();
+    match engine::hashdb::update(&config::Config::load().malwarebazaar_key, true) {
+        Ok(n) => {
+            println!("Hash database updated: {n} known-malware hashes");
+            if let Some(warning) = engine::hashdb::Meta::load().error {
+                println!("Warning: {warning}");
+            }
+            0
+        }
+        Err(e) => {
+            println!("Hash database update failed: {e}");
+            1
+        }
+    }
 }
 
 /// Exit code: 0 clean, 1 suspicious, 2 malicious.

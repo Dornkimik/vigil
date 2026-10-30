@@ -5,7 +5,7 @@ mod theme;
 
 use crate::config::{self, Config};
 use crate::daemon::DAEMON_MUTEX;
-use crate::engine::{Engine, Report, ScanOptions, Source, Verdict};
+use crate::engine::{Engine, Report, ScanOptions, Source, Verdict, hashdb};
 use crate::store::{self, Action, Event, QuarantineEntry, Status};
 use crate::winapi::{self, DefenderResult, NamedMutex};
 use crate::{icon, steam};
@@ -118,6 +118,8 @@ enum Intent {
     Delete(QuarantineEntry),
 }
 
+type UpdateSlot = Arc<Mutex<Option<Result<usize, String>>>>;
+
 struct App {
     page: Page,
     status: Status,
@@ -140,6 +142,10 @@ struct App {
     expanded: HashSet<String>,
     defender: Arc<Mutex<HashMap<PathBuf, DefenderState>>>,
     key_edit: String,
+    hashdb: hashdb::Meta,
+    hashdb_stamp: Option<SystemTime>,
+    /// Result slot of a running "Update now" request.
+    hashdb_update: Option<UpdateSlot>,
     confirm_delete: Option<String>,
     toast: Option<(String, Instant)>,
     title_bar_styled: bool,
@@ -161,6 +167,9 @@ impl App {
             events_stamp: None,
             quarantine: Vec::new(),
             key_edit: config.malwarebazaar_key.clone(),
+            hashdb: hashdb::Meta::default(),
+            hashdb_stamp: None,
+            hashdb_update: None,
             config,
             config_stamp: config::modified(&config::config_path()),
             autostart: winapi::autostart_enabled(),
@@ -202,11 +211,40 @@ impl App {
             self.config_stamp = cs;
             self.config = Config::load();
         }
+        let hs = config::modified(&config::hashdb_meta_path());
+        if force || hs != self.hashdb_stamp {
+            self.hashdb_stamp = hs;
+            self.hashdb = hashdb::Meta::load();
+        }
+        let finished = self.hashdb_update.as_ref().and_then(|slot| slot.lock().unwrap().take());
+        if let Some(result) = finished {
+            self.hashdb_update = None;
+            match result {
+                Ok(n) => self.notify(format!("Hash database updated: {n} known-malware hashes")),
+                Err(e) => self.notify(format!("Hash database update failed: {e}")),
+            }
+        }
     }
 
-    fn update_config(&mut self, f: impl FnOnce(&mut Config)) {
-        self.config = Config::update(f);
+    fn update_hashdb(&mut self) {
+        if self.hashdb_update.is_some() {
+            return;
+        }
+        let slot = Arc::new(Mutex::new(None));
+        let (s, key) = (slot.clone(), self.config.malwarebazaar_key.clone());
+        std::thread::spawn(move || *s.lock().unwrap() = Some(hashdb::update(&key, true)));
+        self.hashdb_update = Some(slot);
+    }
+
+    /// Returns false (and shows why) when the change could not be saved.
+    fn update_config(&mut self, f: impl FnOnce(&mut Config)) -> bool {
+        let (config, saved) = Config::update(f);
+        self.config = config;
         self.config_stamp = config::modified(&config::config_path());
+        if let Err(e) = &saved {
+            self.notify(format!("Could not save settings to {}: {e}", config::config_path().display()));
+        }
+        saved.is_ok()
     }
 
     fn file_exists(&mut self, path: &Path) -> bool {
@@ -747,22 +785,50 @@ impl App {
 
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            section_label(ui, "Online reputation (optional)");
+            section_label(ui, "Known-malware hashes (optional)");
             ui.add_space(6.0);
             ui.label(
-                RichText::new("Look up file hashes on abuse.ch MalwareBazaar to catch known malware. Only SHA-256 hashes of unsigned programs leave your PC.")
-                    .color(DIM),
+                RichText::new(
+                    "Download abuse.ch MalwareBazaar's list of known-malware hashes and check every file against it offline. \
+                     It refreshes twice a day; nothing about your files leaves your PC.",
+                )
+                .color(DIM),
             );
             ui.horizontal(|ui| {
                 ui.add(egui::TextEdit::singleline(&mut self.key_edit).password(true).hint_text("MalwareBazaar Auth-Key").desired_width(320.0));
                 if button(ui, "Save").clicked() {
                     let k = self.key_edit.trim().to_string();
-                    self.update_config(|c| c.malwarebazaar_key = k);
-                    self.notify("API key saved");
+                    let first = self.config.malwarebazaar_key.is_empty() && !k.is_empty();
+                    if self.update_config(|c| c.malwarebazaar_key = k) {
+                        self.notify("API key saved");
+                    }
+                    if first && self.hashdb.hashes == 0 {
+                        self.update_hashdb();
+                    }
                 }
                 if ui.link(RichText::new("Get a free key").color(ACCENT)).clicked() {
                     winapi::open_url("https://auth.abuse.ch/");
                 }
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let status = if self.hashdb_update.is_some() {
+                    "Downloading the hash database... the first download can take a few minutes.".to_string()
+                } else if self.hashdb.hashes > 0 {
+                    format!("{} known-malware hashes, updated {}", self.hashdb.hashes, ago(self.hashdb.recent_sync.max(self.hashdb.full_sync)))
+                } else {
+                    "No hash database downloaded yet.".to_string()
+                };
+                ui.label(RichText::new(status).color(DIM).size(12.5));
+                if let Some(e) = &self.hashdb.error {
+                    ui.label(RichText::new(format!("Last update: {e}")).color(FAINT).size(12.5));
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let ready = self.hashdb_update.is_none() && !self.config.malwarebazaar_key.is_empty();
+                    if ui.add_enabled_ui(ready, |ui| button(ui, "Update now")).inner.clicked() {
+                        self.update_hashdb();
+                    }
+                });
             });
         });
         ui.add_space(12.0);

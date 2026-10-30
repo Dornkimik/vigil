@@ -59,9 +59,14 @@ shows every finding that added to the score.
    Programs and scripts inside ZIPs are unpacked in memory and scanned.
 6. **Authenticode**: a valid signature removes 60% of the heuristic score. Broken or
    untrusted signatures add to it.
-7. **Hash reputation (optional)**: add a free [abuse.ch MalwareBazaar](https://auth.abuse.ch/)
-   key in Settings. Only SHA-256 hashes of unsigned files are sent. You can also put your own
-   SHA-256 blocklist in `%LOCALAPPDATA%\Vigil\blocklist.txt`.
+7. **Known-malware hashes (optional)**: add a free [abuse.ch MalwareBazaar](https://auth.abuse.ch/)
+   key in Settings. Vigil downloads MalwareBazaar's full hash export once (refreshed monthly)
+   and merges in the 48-hour export twice a day. Every file, signed or not, and every program
+   inside a ZIP, is checked offline against this database. No hashes are sent anywhere. The
+   database is a sorted, memory-mapped file (`hashdb-*.bin`, about 35 bytes per hash), so it
+   costs almost no RAM. Until the first download finishes, unsigned files are looked up online
+   instead. `vigil.exe --update-hashes` forces an update. You can also put your own SHA-256
+   blocklist in `%LOCALAPPDATA%\Vigil\blocklist.txt`.
 8. **Defender cross-check**: the *Ask Defender* button sends a single file to
    `MpCmdRun.exe` for a second opinion. Defender does not remediate during this check.
 
@@ -98,6 +103,7 @@ This starts the background service and opens the dashboard. In the dashboard, go
 | `vigil.exe --background` | Service and tray icon only (used for autostart) |
 | `vigil.exe --gui` | Dashboard only |
 | `vigil.exe --scan <paths…> [--fast] [--json] [--out file]` | Command-line scan. Exit code 0 = clean, 1 = suspicious, 2 = malicious |
+| `vigil.exe --update-hashes` | Download the MalwareBazaar hash database now (needs the Auth-Key) |
 
 Tray icon: left-click opens the dashboard. Right-click shows *Scan Downloads now*,
 *Pause protection* and *Exit*.
@@ -167,7 +173,8 @@ and [MITRE ATT&CK obfuscation techniques](https://attack.mitre.org/techniques/T1
 ```
 rules/default.rules   detection rules (obfuscated into the binary at build time)
 build.rs              rule obfuscation + generated .ico embedding
-src/engine/           scanner: rules, PE analysis, ZIP inspection, file-type heuristics
+src/engine/           scanner: rules, PE analysis, ZIP inspection, file-type heuristics,
+                      offline MalwareBazaar hash database (hashdb.rs)
 src/daemon/           background service: watchers, debounced worker, Win32 tray
 src/gui/              egui dashboard and theme
 src/store.rs          activity log, status heartbeat, quarantine vault

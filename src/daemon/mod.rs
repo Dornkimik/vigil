@@ -5,7 +5,7 @@ pub mod tray;
 
 use crate::config::{self, Config};
 use crate::engine::filetype::{TEMP_EXTS, ext_of};
-use crate::engine::{Engine, Report, ScanOptions, Source, Verdict};
+use crate::engine::{Engine, Report, ScanOptions, Source, Verdict, hashdb};
 use crate::store::{self, Action, Event, Status, WatchedDir};
 use crate::{steam, winapi};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -66,6 +66,10 @@ pub fn run(open_gui: bool) {
     {
         let (shared, tx) = (shared.clone(), tx.clone());
         thread::spawn(move || supervisor(shared, tx));
+    }
+    {
+        let shared = shared.clone();
+        thread::spawn(move || signature_updater(shared));
     }
     queue_recent_downloads(&tx);
 
@@ -129,7 +133,8 @@ fn start_watchers(dirs: &[WatchedDir], tx: &Sender<Work>) -> Vec<RecommendedWatc
 fn supervisor(shared: Arc<Shared>, tx: Sender<Work>) {
     let started = store::now();
     let stamp = || {
-        [config::config_path(), config::custom_rules_path(), config::blocklist_path()].map(|p| config::modified(&p))
+        [config::config_path(), config::custom_rules_path(), config::blocklist_path(), config::hashdb_meta_path()]
+            .map(|p| config::modified(&p))
     };
     let mut last_stamp = stamp();
     let mut dirs = desired_watches(&shared.config.read().unwrap());
@@ -170,6 +175,20 @@ fn supervisor(shared: Arc<Shared>, tx: Sender<Work>) {
         }
         .save();
         thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Keeps the offline MalwareBazaar hash database current. A finished update rewrites
+/// hashdb.json, which makes the supervisor load a fresh engine.
+fn signature_updater(shared: Arc<Shared>) {
+    winapi::set_background_priority();
+    thread::sleep(Duration::from_secs(30));
+    loop {
+        let key = shared.config.read().unwrap().malwarebazaar_key.clone();
+        if !key.trim().is_empty() && hashdb::Meta::load().due(store::now()) {
+            let _ = hashdb::update(&key, false);
+        }
+        thread::sleep(Duration::from_secs(60));
     }
 }
 

@@ -154,7 +154,7 @@ fn on_command(id: usize) {
             }
         }
         ID_PAUSE => {
-            let cfg = Config::update(|c| c.paused = !c.paused);
+            let (cfg, _) = Config::update(|c| c.paused = !c.paused);
             *state.shared.config.write().unwrap() = cfg;
             update_icon(NIM_MODIFY);
         }
