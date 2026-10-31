@@ -221,13 +221,23 @@ impl Engine {
         let n = read_up_to(&mut file, &mut head)?;
         r.kind = filetype::classify(&r.name, &head[..n]);
         if r.kind == Kind::Other {
+            // Nothing to analyze, but known samples (Linux/macOS/Android malware, payloads
+            // under a harmless name) are still flagged. Steam's asset files stay unread.
+            if opts.sniff_all && r.size <= MAX_CONTENT_SCAN {
+                let h = sha256_stream(File::open(path)?)?;
+                if let Some(f) = self.known_hash(&h).filter(|_| !self.allowlist.contains(&h)) {
+                    r.analyzed = true;
+                    r.origin = origin(path);
+                    r.sha256 = Some(h);
+                    r.score = f.weight;
+                    r.verdict = Verdict::from_score(r.score);
+                    r.findings = vec![f];
+                }
+            }
             return Ok(r);
         }
         r.analyzed = true;
-
-        if let Some(o) = winapi::zone_identifier(path).filter(|o| o.zone >= 3) {
-            r.origin = Some(o.url.unwrap_or_else(|| "the internet".into()));
-        }
+        r.origin = origin(path);
 
         let downloaded = r.origin.is_some() || opts.source == Source::Downloads;
         let mut findings = name_findings(&r.name, r.kind, opts.source, downloaded);
@@ -473,6 +483,11 @@ fn signature_finding(sig: &Signature, kind: Kind, source: Source) -> Option<Find
             Some(Finding::new("sig.invalid", format!("Digital signature does not verify (0x{c:08X})"), 10))
         }
     }
+}
+
+/// Download URL from the Mark-of-the-Web, for files that came from the internet.
+fn origin(path: &Path) -> Option<String> {
+    winapi::zone_identifier(path).filter(|o| o.zone >= 3).map(|o| o.url.unwrap_or_else(|| "the internet".into()))
 }
 
 fn read_up_to(f: &mut File, buf: &mut [u8]) -> io::Result<usize> {

@@ -352,6 +352,31 @@ fn known_hashes_are_found_in_files_and_inside_zips() {
 }
 
 #[test]
+fn known_hashes_flag_files_that_are_not_windows_code() {
+    let sample = b"\x7fELF\x02\x01\x01 inert fixture bytes";
+    let mut b = hashdb::Builder::new();
+    b.add(Sha256::digest(sample).into(), "Mirai");
+    let path = temp_db("other");
+    b.write(&path).unwrap();
+    let mut engine = engine();
+    engine.hashdb = Some(hashdb::HashDb::open(&path).unwrap());
+    let file = std::env::temp_dir().join(format!("vigil-test-{}-sample.elf", std::process::id()));
+    std::fs::write(&file, sample).unwrap();
+
+    let r = engine.scan_file(&file, ScanOptions { source: Source::Downloads, sniff_all: true }).unwrap();
+    assert!(r.analyzed);
+    assert_eq!(r.verdict, Verdict::Malicious, "{:?}", r.findings);
+    assert!(r.findings.iter().any(|f| f.id == "hash.malwarebazaar" && f.title.contains("Mirai")));
+    // The Steam fast path still never opens non-code files.
+    let r = engine.scan_file(&file, ScanOptions { source: Source::Steam, sniff_all: false }).unwrap();
+    assert!(!r.analyzed);
+
+    let _ = std::fs::remove_file(&file);
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn corrupt_database_files_are_rejected() {
     let path = temp_db("corrupt");
     std::fs::write(&path, b"VIGILHD1\xff\xff\xff\xff\xff\xff\xff\xff\0\0\0\0\0\0\0\0").unwrap();
