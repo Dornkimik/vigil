@@ -997,7 +997,8 @@ impl App {
     fn report_card(&mut self, ui: &mut Ui, r: &Report, event: Option<&Event>, intents: &mut Vec<Intent>) {
         let key = format!("{}|{}", r.path.display(), event.map(|e| e.time).unwrap_or(0));
         let open = self.expanded.contains(&key);
-        let exists = self.file_exists(&r.path);
+        // A command line's path is the Windows program that ran it: nothing to quarantine or inspect.
+        let exists = r.command.is_none() && self.file_exists(&r.path);
         let defender = self.defender.lock().unwrap().get(&r.path).cloned();
 
         card().inner_margin(egui::Margin::symmetric(16, 12)).show(ui, |ui| {
@@ -1038,6 +1039,9 @@ impl App {
             }
             ui.add_space(6.0);
             ui.add(egui::Label::new(RichText::new(r.path.display().to_string()).color(DIM).size(12.5)).wrap());
+            if let Some(c) = &r.command {
+                ui.add(egui::Label::new(RichText::new(c).monospace().color(DIM).size(12.0)).wrap().selectable(true));
+            }
             if let Some(o) = &r.origin {
                 ui.label(RichText::new(format!("Downloaded from {o}")).color(DIM).size(12.5));
             }
@@ -1182,13 +1186,15 @@ fn action_label(a: Action) -> &'static str {
         Action::Restored => "Restored",
         Action::Deleted => "Deleted",
         Action::Allowed => "Marked safe",
+        Action::Stopped => "Stopped",
+        Action::StopFailed => "Could not stop",
     }
 }
 
 fn action_color(a: Action) -> Color32 {
     match a {
-        Action::QuarantineFailed => DANGER,
-        Action::Quarantined => WARN,
+        Action::QuarantineFailed | Action::StopFailed => DANGER,
+        Action::Quarantined | Action::Stopped => WARN,
         _ => DIM,
     }
 }

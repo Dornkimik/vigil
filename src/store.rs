@@ -22,6 +22,10 @@ pub enum Action {
     Restored,
     Deleted,
     Allowed,
+    /// A script host running a malicious command was ended.
+    Stopped,
+    /// A script host running a malicious command could not be ended (it runs elevated).
+    StopFailed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

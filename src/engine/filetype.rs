@@ -13,6 +13,8 @@ pub enum Kind {
     Installer,
     DiskImage,
     OfficeMacro,
+    /// The command line a script host was started with, not a file.
+    Command,
     Other,
 }
 
@@ -26,6 +28,7 @@ impl Kind {
             Kind::Installer => "Installer",
             Kind::DiskImage => "Disk image",
             Kind::OfficeMacro => "Office document",
+            Kind::Command => "Command line",
             Kind::Other => "File",
         }
     }

@@ -6,11 +6,15 @@
 //! given, so for them the DLLs come next: the one named on the command line, and every
 //! DLL from outside the Windows folder they load while they run.
 //!
+//! PowerShell, cmd, mshta and Windows Script Host run code given on their command line,
+//! which never touches the disk, so their command lines are scanned too, along with the
+//! script file they are told to run.
+//!
 //! Each program is also reported with its process ID, so its memory can be checked
 //! once it has had time to unpack itself.
 
 use super::{Shared, Work};
-use crate::engine::filetype;
+use crate::engine::{cmdline, filetype};
 use crate::winapi;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -47,6 +51,13 @@ pub fn run(shared: Arc<Shared>, tx: Sender<Work>) {
                     let named: HashSet<PathBuf> = named.into_iter().map(long_path).collect();
                     queue.extend(named.iter().filter(|dll| !is_system(dll, &system_root)).cloned().map(Work::Launched));
                     hosts.insert(pid, named);
+                }
+                if cmdline::is_script_host(&image)
+                    && let Some(line) = winapi::process_command_line(pid)
+                {
+                    let script = cmdline::script_file(&image, &winapi::split_args(&line)).map(long_path);
+                    queue.extend(script.filter(|s| !is_system(s, &system_root)).map(Work::Launched));
+                    queue.push(Work::Command(pid, image.clone(), line));
                 }
                 if is_system(&image, &system_root) || own_exe.as_ref().is_some_and(|e| e.as_os_str().eq_ignore_ascii_case(image.as_os_str())) {
                     continue;

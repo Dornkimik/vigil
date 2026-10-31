@@ -2,6 +2,7 @@
 //! and turns everything into a scored [`Report`].
 
 pub mod archive;
+pub mod cmdline;
 mod deobfuscate;
 pub mod filetype;
 pub mod hashdb;
@@ -133,6 +134,10 @@ pub struct Report {
     pub origin: Option<String>,
     /// False when the file was skipped (not a code-carrying file type).
     pub analyzed: bool,
+    /// For [`Kind::Command`]: the command line that was scanned. `path` is then the
+    /// program that runs it, which is Windows' own and never quarantined.
+    #[serde(default)]
+    pub command: Option<String>,
 }
 
 impl Report {
@@ -149,6 +154,7 @@ impl Report {
             signer: None,
             origin: None,
             analyzed: false,
+            command: None,
         }
     }
 }
@@ -335,6 +341,32 @@ impl Engine {
         Ok(r)
     }
 
+    /// Scans the command line a script host (PowerShell, cmd, mshta, Windows Script Host)
+    /// was started with. Code passed inline never reaches the disk, so this is the only
+    /// look at it. The hash is the command line's, so "Mark as safe" allows that command.
+    pub fn scan_command(&self, image: &Path, line: &str) -> Report {
+        let host = image.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+        let mut r = Report::new(image);
+        r.name = format!("{host} command line");
+        r.kind = Kind::Command;
+        r.size = line.len() as u64;
+        r.analyzed = true;
+        r.command = Some(line.to_string());
+        let h = hex(&Sha256::digest(line.as_bytes()));
+        r.sha256 = Some(h.clone());
+        if self.allowlist.contains(&h) {
+            r.findings.push(Finding::new("allowlist", "You marked this command as safe", 0));
+            return r;
+        }
+        // The caller picks argv[0] freely; rules see the program that really runs.
+        let text = format!("{host} {}", cmdline::arguments(line));
+        let (score, findings) = self.analyze(cmdline::script_name(&host), text.as_bytes(), Kind::Script, 0, true);
+        r.score = score.max(0);
+        r.verdict = Verdict::from_score(r.score);
+        r.findings = findings;
+        r
+    }
+
     /// Content heuristics for an in-memory buffer (a file or an archive member).
     pub(crate) fn analyze_buffer(&self, name: &str, data: &[u8], kind: Kind, depth: u32) -> (i32, Vec<Finding>) {
         self.analyze(name, data, kind, depth, true)
@@ -503,7 +535,9 @@ fn correlate(findings: &mut Vec<Finding>) {
     .iter()
     .any(|id| has(&format!("rule.stealer.{id}")));
     let exfil = has("rule.stealer.exfil_channel");
-    let loader = ["download_cradle", "curl_cradle", "script_cradle", "script_dropper", "memory_payload"].iter().any(|id| has(&format!("rule.loader.{id}")));
+    let loader = ["download_cradle", "curl_cradle", "script_cradle", "script_dropper", "memory_payload", "download_execute", "hidden_web_request", "mshta_remote"]
+        .iter()
+        .any(|id| has(&format!("rule.loader.{id}")));
     let tamper = [
         "defender_tamper",
         "defender_policy",

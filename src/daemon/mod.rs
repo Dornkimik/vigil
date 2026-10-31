@@ -53,6 +53,8 @@ pub enum Work {
     /// A program that just started, by process ID. Its memory is checked once it has had
     /// time to unpack itself.
     Started(u32, PathBuf),
+    /// A script host that just started (process ID, program, command line). Scanned right away.
+    Command(u32, PathBuf, String),
 }
 
 pub fn run(open_gui: bool) {
@@ -321,6 +323,10 @@ impl Worker {
                 self.memory.push(MemoryScan { pid, path, started: Instant::now(), pass: 0 });
                 return;
             }
+            Work::Command(pid, image, line) => {
+                self.scan_command(pid, &image, &line);
+                return;
+            }
             Work::Changed(p, s) => (p, s, false, false),
             Work::Scan(p, s) => (p, s, true, false),
             Work::Launched(p) => (p, Source::Launch, false, true),
@@ -359,6 +365,18 @@ impl Worker {
             }
         }
         self.scan_memory();
+    }
+
+    /// Checks the command line a script host started with. It is short and the host may
+    /// finish within moments, so it goes ahead of everything else.
+    fn scan_command(&mut self, pid: u32, image: &Path, line: &str) {
+        if self.shared.config.read().unwrap().paused {
+            return;
+        }
+        let engine = self.shared.engine.read().unwrap().clone();
+        let report = engine.scan_command(image, line);
+        self.shared.scanned.fetch_add(1, Ordering::Relaxed);
+        handle_command(&self.shared, &report, pid);
     }
 
     /// Checks the memory of programs that started a while ago.
@@ -540,7 +558,34 @@ fn handle_report(shared: &Shared, report: &Report, source: Source, launched: boo
     if retry && action != Action::Quarantined {
         return action;
     }
+    announce(&cfg, report, source, launched, action);
+    action
+}
 
+/// A script host started with a malicious command is stopped. There is no file to
+/// quarantine: the program is Windows' own and the code lives only in its command line.
+fn handle_command(shared: &Shared, report: &Report, pid: u32) {
+    let cfg = shared.config.read().unwrap().clone();
+    if report.verdict >= Verdict::Suspicious {
+        shared.threats.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut action = Action::None;
+    if report.verdict == Verdict::Malicious
+        && cfg.auto_quarantine
+        && let Some(line) = &report.command
+    {
+        action = match winapi::stop_process(pid, line) {
+            Some(true) => Action::Stopped,
+            Some(false) => Action::StopFailed,
+            // It finished already.
+            None => Action::None,
+        };
+    }
+    announce(&cfg, report, Source::Launch, true, action);
+}
+
+/// Notifies and logs what was found and done.
+fn announce(cfg: &Config, report: &Report, source: Source, launched: bool, action: Action) {
     let reason = report.findings.iter().filter(|f| f.weight > 0).max_by_key(|f| f.weight).map(|f| f.title.as_str()).unwrap_or("");
     if cfg.notifications {
         let note = match (report.verdict, action) {
@@ -556,6 +601,12 @@ fn handle_report(shared: &Shared, report: &Report, source: Source, launched: boo
             (Verdict::Malicious, Action::QuarantineFailed) => {
                 Some(("Threat detected - action needed", format!("{} is in use and could not be quarantined.", report.name), true))
             }
+            (Verdict::Malicious, Action::Stopped) => Some(("Threat stopped", format!("{}\n{reason}", report.name), true)),
+            (Verdict::Malicious, Action::StopFailed) => Some((
+                "Threat detected - action needed",
+                format!("{} is running a malicious command and could not be stopped.", report.name),
+                true,
+            )),
             (Verdict::Malicious, _) => Some(("Threat detected", format!("{}\n{reason}", report.name), true)),
             (Verdict::Suspicious, _) if cfg.notify_suspicious => Some(("Suspicious file", format!("{}\n{reason}", report.name), false)),
             _ => None,
@@ -570,7 +621,6 @@ fn handle_report(shared: &Shared, report: &Report, source: Source, launched: boo
     if !noisy || report.verdict != Verdict::Clean {
         store::append_event(&Event { time: store::now(), source, action, report: report.clone() });
     }
-    action
 }
 
 #[cfg(test)]

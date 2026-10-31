@@ -38,8 +38,9 @@ shows every finding that added to the score.
    matched case-insensitively in ASCII and UTF-16LE/BE (including .NET string literals):
    - Info-stealer behavior: browser credential and cookie stores, Discord tokens, crypto
      wallets, Telegram and Steam sessions, Discord webhook and Telegram bot exfiltration.
-   - Loaders: PowerShell and LOLBin download cradles, Windows Script Host droppers,
-     paste-site payloads, AutoIt.
+   - Loaders: PowerShell and LOLBin download cradles, downloads that are saved and started,
+     web requests from a hidden PowerShell window, remote or inline `mshta` applications,
+     Windows Script Host droppers, paste-site payloads, AutoIt.
    - Evasion: turning off Defender or adding exclusions (through PowerShell, policy registry
      keys, the exclusions key, or by stopping its service or removing its definitions),
      UAC bypasses, sandbox and VM checks, killing security tools (including .NET
@@ -63,7 +64,10 @@ shows every finding that added to the score.
 2. **Static script recovery**: scripts (including `.py`/`.pyw`) and shortcut command text
    are checked for nested Base64/UTF-16 payloads, Base64-wrapped gzip/zlib/Deflate streams,
    adjacent quoted string concatenation, JavaScript/Python hex and Unicode escapes,
-   and selected PowerShell backtick/batch caret escapes. Nothing is executed. Recovered
+   and selected PowerShell backtick/batch caret escapes. PowerShell switches are written out
+   in full however they are abbreviated or dashed (`-w 1`, `/win hidden` and `–WindowStyle Hidden`
+   all read as `-WindowStyle Hidden`), and the cradle aliases (`iwr`, `irm`, `iex`, `saps`) in
+   PowerShell code are spelled out. Nothing is executed. Recovered
    evidence is labeled in findings and each rule scores only once across representations.
    Recovery examines the first 2 MiB, at most three transformation levels and 16 views,
    with separate 4 MiB budgets for recovered views and decoding/decompression work.
@@ -125,7 +129,16 @@ Malicious files are quarantined automatically (configurable). If the file is a p
 running, Vigil stops every process running it first, since Windows locks a running program's file.
 When a file can't be moved (it is in use, or its program runs as administrator), Vigil tries again
 every 30 seconds for ten minutes, and a malicious program is checked again every time it starts.
-Suspicious files only trigger a notification. Quarantined files are XOR-encoded in `%LOCALAPPDATA%\Vigil\quarantine` so they
+Suspicious files only trigger a notification.
+
+PowerShell, `cmd`, `mshta`, Windows Script Host and `conhost` run code given on their command
+line, which never touches the disk, so the command line of each one that starts is scanned like
+a script, and so is the script file it is told to run (`-File x.ps1`, `wscript x.vbs`,
+`cmd /c x.bat`). A hidden window or `-ExecutionPolicy Bypass` alone is normal for installers and
+background tools and only adds a few points; a hidden window that makes a web request is
+suspicious, and one that downloads and runs code is malicious. A malicious command gets that one
+process stopped (nothing is quarantined, since the program is Windows' own), and *Mark as safe*
+allows that exact command line. Quarantined files are XOR-encoded in `%LOCALAPPDATA%\Vigil\quarantine` so they
 can't run by accident. Restoring a file also marks it as safe.
 
 The rules are obfuscated at build time (`build.rs`), so `vigil.exe` does not contain the
@@ -234,7 +247,9 @@ and [MITRE ATT&CK obfuscation techniques](https://attack.mitre.org/techniques/T1
 - The program-start check is a static scan of the program file when it starts, not runtime
   behavior monitoring. Vigil checks the process list once a second without admin rights, so the
   program is already running when it is scanned, and one that starts and exits within a second
-  can be missed. Programs running as administrator cannot be stopped; Vigil notifies you instead.
+  can be missed. That matters most for script hosts: a one-line PowerShell command that
+  finishes within a second can be missed, and one that is caught has already started. Programs
+  running as administrator cannot be stopped; Vigil notifies you instead.
   DLLs are only checked for `rundll32.exe` and `regsvr32.exe`, and only under those names:
   DLLs that other programs load (DLL sideloading) and renamed copies of these hosts are not.
 

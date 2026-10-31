@@ -10,6 +10,8 @@ const MAX_OUTPUT: usize = 4 << 20;
 const MAX_VIEWS: usize = 16;
 const MAX_DEPTH: usize = 3;
 const MAX_TOKENS: usize = 128;
+/// Decoded commands are also put back into texts up to this size (command lines, shortcuts).
+const MAX_INLINE: usize = 64 << 10;
 
 pub fn views(name: &str, data: &[u8]) -> Vec<Vec<u8>> {
     let input = &data[..data.len().min(MAX_INPUT)];
@@ -36,6 +38,13 @@ pub fn views(name: &str, data: &[u8]) -> Vec<Vec<u8>> {
         let batch = matches!(ext.as_str(), "bat" | "cmd") || lower.contains("cmd.exe");
         let normalized = normalize(&source, powershell, batch);
         let mut candidates = vec![normalized.clone()];
+        if powershell {
+            // Switches and aliases spelled out, so `-w hidden` and `iwr` match like their full forms.
+            let canonical = super::cmdline::canonical_powershell(&normalized);
+            let script = matches!(ext.as_str(), "ps1" | "psm1");
+            let expanded = if script { super::cmdline::expand_aliases(canonical.as_deref().unwrap_or(&normalized)) } else { None };
+            candidates.extend(expanded.or(canonical));
+        }
         let lower = normalized.to_ascii_lowercase();
         // Encoding data is normal. Only unwrap blobs in scripts with a decoder or
         // encoded-command switch, and ignore embedded web assets.
@@ -65,6 +74,16 @@ pub fn views(name: &str, data: &[u8]) -> Vec<Vec<u8>> {
                     decode_budget -= token.len();
                     if let Ok(decoded) = STANDARD.decode(token).or_else(|_| STANDARD_NO_PAD.decode(token)) {
                         if let Some(t) = text(&decoded) {
+                            // An encoded command is PowerShell code, whatever file it came from.
+                            if powershell {
+                                candidates.extend(super::cmdline::expand_aliases(&t));
+                                // Put back in place, so rules see the code next to the switches it runs with.
+                                if normalized.len() <= MAX_INLINE
+                                    && let Some(switch) = encoded_command_switch(&normalized, start)
+                                {
+                                    candidates.push(format!("{}-Command {t}{}", &normalized[..switch], &normalized[end..]));
+                                }
+                            }
                             candidates.push(t);
                         } else if let Some(t) = compressed_text(&decoded, &lower, &mut decode_budget) {
                             candidates.push(t);
@@ -88,6 +107,16 @@ pub fn views(name: &str, data: &[u8]) -> Vec<Vec<u8>> {
         }
     }
     result
+}
+
+/// Where the -EncodedCommand switch (however abbreviated) right before `token` starts.
+fn encoded_command_switch(text: &str, token: usize) -> Option<usize> {
+    let before = text[..token].trim_end_matches(|c: char| c.is_ascii_whitespace());
+    if before.len() == token {
+        return None;
+    }
+    let start = before.rfind(|c: char| c.is_ascii_whitespace()).map_or(0, |i| i + 1);
+    (super::cmdline::powershell_switch(&before[start..])?.0 == "EncodedCommand").then_some(start)
 }
 
 /// LNK is a binary container, so recover individual ASCII / UTF-16LE command

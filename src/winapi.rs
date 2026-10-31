@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr::{null, null_mut};
 
+use crate::engine::cmdline;
+
 use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::Cryptography::{CERT_NAME_SIMPLE_DISPLAY_TYPE, CertGetNameStringW};
@@ -215,11 +217,24 @@ pub fn process_image(pid: u32) -> Option<PathBuf> {
 
 /// Arguments a process was started with, split the way the C runtime splits them.
 pub fn process_args(pid: u32) -> Option<Vec<String>> {
+    process_command_line(pid).map(|line| split_args(&line))
+}
+
+/// The command line a process was started with, as it was given.
+pub fn process_command_line(pid: u32) -> Option<String> {
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h.is_null() {
             return None;
         }
+        let line = command_line_of(h);
+        CloseHandle(h);
+        line
+    }
+}
+
+unsafe fn command_line_of(h: HANDLE) -> Option<String> {
+    unsafe {
         // The first call reports the size; u64 storage keeps the UNICODE_STRING header aligned.
         let mut buf: Vec<u64> = Vec::new();
         let mut len = 0u32;
@@ -231,7 +246,6 @@ pub fn process_args(pid: u32) -> Option<Vec<String>> {
             }
             buf = vec![0; (len as usize).div_ceil(8)];
         }
-        CloseHandle(h);
         if status < 0 || buf.is_empty() {
             return None;
         }
@@ -239,12 +253,18 @@ pub fn process_args(pid: u32) -> Option<Vec<String>> {
         if line.Buffer.is_null() {
             return None;
         }
-        let mut w = std::slice::from_raw_parts(line.Buffer, line.Length as usize / 2).to_vec();
-        w.push(0);
+        Some(String::from_utf16_lossy(std::slice::from_raw_parts(line.Buffer, line.Length as usize / 2)))
+    }
+}
+
+/// Splits a command line the way the C runtime does.
+pub fn split_args(line: &str) -> Vec<String> {
+    let w = wide(line);
+    unsafe {
         let mut n = 0;
         let argv = CommandLineToArgvW(w.as_ptr(), &mut n);
         if argv.is_null() {
-            return None;
+            return Vec::new();
         }
         let args = (0..n.max(0) as usize)
             .map(|i| {
@@ -254,7 +274,7 @@ pub fn process_args(pid: u32) -> Option<Vec<String>> {
             })
             .collect();
         LocalFree(argv.cast());
-        Some(args)
+        args
     }
 }
 
@@ -380,21 +400,28 @@ impl Drop for ProcessMemory {
 }
 
 /// Ends every process running `file`, or, when none runs it, every process that has it
-/// loaded as a DLL. Matches by path rather than PID so a reused PID never hits an
-/// unrelated program. Returns false if one of them could not be stopped.
+/// loaded as a DLL, or else every script host told to run it. Matches by path rather
+/// than PID so a reused PID never hits an unrelated program. Returns false if one of
+/// them could not be stopped.
 /// Processes we cannot open (elevated ones) are skipped; quarantine then fails visibly.
 pub fn stop_processes_using(file: &Path) -> bool {
     let same = |p: &Path| p.as_os_str().eq_ignore_ascii_case(file.as_os_str());
     let mut all = true;
     let mut found = false;
-    for as_module in [false, true] {
+    for pass in 0..3 {
         for pid in process_ids() {
             unsafe {
                 let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
                 if h.is_null() {
                     continue;
                 }
-                let uses = if as_module { process_modules(pid).iter().any(|m| same(m)) } else { image_of(h).is_some_and(|p| same(&p)) };
+                let uses = match pass {
+                    0 => image_of(h).is_some_and(|p| same(&p)),
+                    1 => process_modules(pid).iter().any(|m| same(m)),
+                    _ => image_of(h).filter(|i| cmdline::is_script_host(i)).is_some_and(|image| {
+                        command_line_of(h).and_then(|l| cmdline::script_file(&image, &split_args(&l))).is_some_and(|s| same(&s))
+                    }),
+                };
                 if uses {
                     found = true;
                     all &= TerminateProcess(h, 1) != 0 && WaitForSingleObject(h, 5000) == WAIT_OBJECT_0;
@@ -407,6 +434,26 @@ pub fn stop_processes_using(file: &Path) -> bool {
         }
     }
     all
+}
+
+/// Ends the process `pid` if it still runs `command_line`, so a reused PID is never hit.
+/// `None` when it has exited already, `Some(false)` when it could not be stopped (it runs
+/// elevated).
+pub fn stop_process(pid: u32, command_line: &str) -> Option<bool> {
+    unsafe {
+        let mut h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
+        let can_stop = !h.is_null();
+        if !can_stop {
+            h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return None;
+            }
+        }
+        let same = command_line_of(h).is_some_and(|l| l == command_line);
+        let stopped = same && can_stop && TerminateProcess(h, 1) != 0 && WaitForSingleObject(h, 5000) == WAIT_OBJECT_0;
+        CloseHandle(h);
+        same.then_some(stopped)
+    }
 }
 
 pub struct NamedMutex(HANDLE);
@@ -568,5 +615,20 @@ pub fn defender_scan(path: &Path) -> DefenderResult {
             }
         }
         Err(e) => DefenderResult::Error(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_and_splits_a_command_line() {
+        let me = std::process::id();
+        let line = process_command_line(me).unwrap();
+        assert_eq!(split_args(&line), std::env::args().collect::<Vec<_>>());
+        assert_eq!(process_args(me), Some(std::env::args().collect()));
+        // Only the process still running the scanned command is stopped.
+        assert_eq!(stop_process(me, "some other command"), None);
     }
 }

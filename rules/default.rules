@@ -147,7 +147,7 @@ rule loader.download_cradle
   desc   Downloads and executes code (PowerShell / LOLBin download cradle)
   weight 35
   min    2
-  require DownloadString | DownloadData | Invoke-WebRequest
+  require DownloadString | DownloadData | Invoke-WebRequest | Invoke-RestMethod
   require Invoke-Expression | IEX( | IEX ( | IEX $ | 'IEX' | "IEX" | | IEX | ScriptBlock]::Create
   mask   "Invoke-WebRequest",
   mask   "Invoke-WebRequest"]
@@ -156,6 +156,13 @@ rule loader.download_cradle
   mask   'Invoke-WebRequest']
   mask   'Invoke-WebRequest':
   mask   ,Invoke-WebRequest,
+  mask   "Invoke-RestMethod",
+  mask   "Invoke-RestMethod"]
+  mask   "Invoke-RestMethod":
+  mask   'Invoke-RestMethod',
+  mask   'Invoke-RestMethod']
+  mask   'Invoke-RestMethod':
+  mask   ,Invoke-RestMethod,
   str    DownloadString(
   str    DownloadFile(
   str    DownloadData(
@@ -169,6 +176,7 @@ rule loader.download_cradle
   str    -WindowStyle Hidden
   str    -w hidden
   str    Invoke-WebRequest
+  str    Invoke-RestMethod
   str    bitsadmin /transfer
   str    certutil -urlcache
   str    certutil.exe -urlcache
@@ -185,6 +193,47 @@ rule loader.curl_cradle
   near   256
   require curl http | curl.exe http
   require Invoke-Expression | IEX( | IEX ( | IEX $ | | IEX | ScriptBlock]::Create
+end
+
+# Saves a download and starts it. Installer helper scripts do this in plain sight, so it
+# stays below the alert threshold until something else (a hidden window) backs it up.
+rule loader.download_execute
+  desc   Downloads a file and starts it
+  weight 30
+  near   512
+  require -OutFile | DownloadFile( | Start-BitsTransfer
+  require Start-Process | Invoke-Item
+end
+
+# Background tools run PowerShell hidden all the time, so a hidden window only adds to
+# what the command does. Switches arrive written out in full (-w -> -WindowStyle).
+rule evasion.hidden_powershell
+  desc   Starts PowerShell or a console with its window hidden
+  weight 10
+  require -WindowStyle Hidden | -w hidden | conhost --headless | conhost.exe --headless
+end
+
+rule evasion.execution_policy_bypass
+  desc   Turns off PowerShell's execution policy for the script it runs
+  weight 5
+  require -ExecutionPolicy Bypass | -ExecutionPolicy Unrestricted
+end
+
+# A web request nobody can see: a downloader's first stage, or a beacon reporting home.
+rule loader.hidden_web_request
+  desc   Makes a web request from a hidden PowerShell window
+  weight 30
+  near   512
+  require -WindowStyle Hidden | -w hidden | conhost --headless | conhost.exe --headless
+  require Invoke-WebRequest | Invoke-RestMethod | Net.WebClient | DownloadString( | DownloadFile( | DownloadData( | Start-BitsTransfer | Net.Http.HttpClient
+end
+
+# mshta runs HTML applications with full access to the machine. Given a web address or
+# inline script, it runs code that never touched the disk.
+rule loader.mshta_remote
+  desc   Runs a remote or inline HTML application with mshta
+  weight 35
+  require mshta http | mshta.exe http | mshta "http | mshta.exe "http | mshta vbscript: | mshta.exe vbscript: | mshta javascript: | mshta.exe javascript:
 end
 
 # exec(requests.get(url).text) and friends. These names are everywhere in large
