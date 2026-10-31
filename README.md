@@ -139,7 +139,10 @@ a script, and so is the script file it is told to run (`-File x.ps1`, `wscript x
 background tools and only adds a few points; a hidden window that makes a web request is
 suspicious, and one that downloads and runs code is malicious. A malicious command gets that
 process and everything it started stopped (nothing is quarantined, since the program is Windows'
-own), and *Mark as safe* allows that exact command line.
+own), and *Mark as safe* allows that exact command line. YARA rules don't run on command lines:
+their PowerShell rules flag encoded commands as such, and developer tools (VS Code, Claude Code,
+management agents) pass every command encoded. The string rules decode the command and judge what
+it does instead.
 
 Droppers write a script and run it straight away, so scripts that Windows runs on a double-click
 or at login (`.bat`, `.cmd`, `.ps1`, `.vbs`, `.hta`, `.lnk`…) are scanned the moment they are saved
@@ -171,6 +174,12 @@ or another program:
   run as SYSTEM. Turning admin mode on again updates the copy.
 - Polling stays on at once a second as a safety net, and fast polling isn't needed while the helper
   is connected.
+- A second task, `\Vigil\Start at login`, starts Vigil when you log in, with your normal rights.
+  Windows skips the startup programs in the Run key after some logins, and Task Scheduler doesn't
+  depend on that. The task runs `vigil.exe --logon` from the protected copy, which starts whatever
+  Vigil's autostart entry names, so turning autostart off in Settings still keeps Vigil from
+  starting, and a Vigil you moved is still found. When Windows does run the entry too, the second
+  Vigil sees the first and exits.
 
 Admin mode still can't stop programs that run as administrator, or read their memory: Vigil
 itself doesn't have admin rights. `vigil.exe --admin-mode off` removes the task and the copy.

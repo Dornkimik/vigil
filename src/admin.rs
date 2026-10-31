@@ -8,6 +8,9 @@
 //!
 //! The task runs a copy in Program Files, which only administrators can change. Pointing it
 //! at vigil.exe wherever the user keeps it would let anything that can write there run as SYSTEM.
+//!
+//! A second task starts Vigil itself at login, with the user's own rights. Windows skips the
+//! Run key's startup programs after some logons; Task Scheduler doesn't depend on that.
 
 use crate::winapi::{self, CREATE_NO_WINDOW, wide};
 use std::os::windows::process::CommandExt;
@@ -21,10 +24,12 @@ use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::Diagnostics::Etw::*;
 use windows_sys::Win32::System::Pipes::*;
+use windows_sys::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB;
 use windows_sys::core::GUID;
 
 pub const PIPE: &str = r"\\.\pipe\Vigil.ProcessEvents";
 const TASK: &str = r"\Vigil\Process events";
+const LOGIN_TASK: &str = r"\Vigil\Start at login";
 const SESSION: &str = "Vigil Process Events";
 const KERNEL_PROCESS: GUID = GUID::from_u128(0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716);
 const KEYWORD_PROCESS: u64 = 0x10;
@@ -38,6 +43,7 @@ const FLUSH_MS: u32 = 10;
 const DONE: u32 = 0;
 const COPY_FAILED: u32 = 2;
 const TASK_FAILED: u32 = 3;
+const LOGIN_TASK_FAILED: u32 = 4;
 
 /// Connected readers' pipe handles (stored as integers: raw handles aren't `Send`).
 static READERS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
@@ -58,17 +64,24 @@ pub fn installed() -> bool {
 /// Turns admin mode on or off, asking for admin approval (UAC) when not elevated already.
 pub fn set(enabled: bool) -> Result<(), String> {
     let arg = if enabled { "on" } else { "off" };
-    let code = if winapi::is_elevated() { apply(enabled) } else { winapi::run_elevated(&["--admin-mode", arg]).ok_or("Admin approval was declined.")? };
+    // The approval may come from another account; the login task is for this one.
+    let user = winapi::user_sid().unwrap_or_default();
+    let code = if winapi::is_elevated() {
+        apply(enabled, Some(user))
+    } else {
+        winapi::run_elevated(&["--admin-mode", arg, &user]).ok_or("Admin approval was declined.")?
+    };
     match code {
         DONE => Ok(()),
         COPY_FAILED => Err(format!("Could not copy Vigil to {}.", helper_path().display())),
         TASK_FAILED => Err("Could not set up the scheduled task that starts admin mode.".into()),
+        LOGIN_TASK_FAILED => Err("Admin mode is on, but the task that starts Vigil at login could not be set up.".into()),
         c => Err(format!("Admin mode setup failed (code {c}).")),
     }
 }
 
-/// `vigil.exe --admin-mode on|off`. Elevated, it does the work and exits with its code for
-/// the instance that asked; otherwise it asks for approval first.
+/// `vigil.exe --admin-mode on|off [user SID]`. Elevated, it does the work and exits with its
+/// code for the instance that asked; otherwise it asks for approval first.
 pub fn cli(args: &[String]) -> i32 {
     let enabled = match args.first().map(String::as_str) {
         Some("on") => true,
@@ -76,7 +89,8 @@ pub fn cli(args: &[String]) -> i32 {
         _ => return 1,
     };
     if winapi::is_elevated() {
-        return apply(enabled) as i32;
+        let user = args.get(1).cloned().filter(|s| is_sid(s)).or_else(winapi::user_sid);
+        return apply(enabled, user) as i32;
     }
     winapi::attach_parent_console();
     match set(enabled) {
@@ -91,11 +105,18 @@ pub fn cli(args: &[String]) -> i32 {
     }
 }
 
-fn apply(enabled: bool) -> u32 {
+/// A security identifier like `S-1-5-21-…`, and nothing that could break out of the task XML.
+fn is_sid(s: &str) -> bool {
+    s.strip_prefix("S-1-").is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit() || b == b'-'))
+}
+
+/// `user` is the account whose Vigil the login task starts.
+fn apply(enabled: bool, user: Option<String>) -> u32 {
     stop_helper();
     let helper = helper_path();
     if !enabled {
         let _ = schtasks(&["/delete", "/tn", TASK, "/f"]);
+        let _ = schtasks(&["/delete", "/tn", LOGIN_TASK, "/f"]);
         // The helper's file stays locked for a moment after it exits.
         for _ in 0..20 {
             if !helper.exists() || std::fs::remove_file(&helper).is_ok() {
@@ -124,21 +145,76 @@ fn apply(enabled: bool) -> u32 {
     if !copied {
         return COPY_FAILED;
     }
-    // Next to the helper: only administrators can write there, so the definition can't be swapped.
-    let xml = helper.with_file_name("task.xml");
-    let utf16: Vec<u8> = [0xFEFF].into_iter().chain(task_xml(&helper).encode_utf16()).flat_map(u16::to_le_bytes).collect();
-    let created = std::fs::write(&xml, utf16).is_ok() && schtasks(&["/create", "/tn", TASK, "/xml", &xml.to_string_lossy(), "/f"]);
-    let _ = std::fs::remove_file(&xml);
-    if !created || !schtasks(&["/run", "/tn", TASK]) {
+    if !register(TASK, &helper_task_xml(&helper)) || !schtasks(&["/run", "/tn", TASK]) {
         return TASK_FAILED;
     }
-    DONE
+    match user.filter(|u| is_sid(u)) {
+        Some(user) if register(LOGIN_TASK, &login_task_xml(&helper, &user)) => DONE,
+        _ => LOGIN_TASK_FAILED,
+    }
 }
 
-/// The scheduled task: SYSTEM, at boot, never stopped for running long or for battery power,
+/// Creates or replaces a scheduled task from its XML definition.
+fn register(name: &str, definition: &str) -> bool {
+    // Next to the helper: only administrators can write there, so the definition can't be swapped.
+    let xml = helper_path().with_file_name("task.xml");
+    let utf16: Vec<u8> = [0xFEFF].into_iter().chain(definition.encode_utf16()).flat_map(u16::to_le_bytes).collect();
+    let created = std::fs::write(&xml, utf16).is_ok() && schtasks(&["/create", "/tn", name, "/xml", &xml.to_string_lossy(), "/f"]);
+    let _ = std::fs::remove_file(&xml);
+    created
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Starts Vigil when `user` logs on, with their own rights, through the protected copy (see
+/// [`logon`]). Normal priority: Vigil's tray and scans set their own.
+fn login_task_xml(helper: &std::path::Path, user: &str) -> String {
+    let command = xml_escape(&helper.to_string_lossy());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><Description>Vigil admin mode: starts Vigil at login, also when Windows skips its startup programs.</Description></RegistrationInfo>
+  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger></Triggers>
+  <Principals><Principal id="User"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <IdleSettings><StopOnIdleEnd>false</StopOnIdleEnd><RestartOnIdle>false</RestartOnIdle></IdleSettings>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>5</Priority>
+  </Settings>
+  <Actions Context="User"><Exec><Command>{command}</Command><Arguments>--logon</Arguments></Exec></Actions>
+</Task>
+"#
+    )
+}
+
+/// `vigil.exe --logon`, run by the login task as the user: starts Vigil the way its autostart
+/// entry says. The entry decides: it is gone when autostart is turned off in Settings, and it
+/// names the vigil.exe the user runs. When Windows does run the entry too, the second Vigil
+/// finds the first one running and exits.
+pub fn logon() -> i32 {
+    let Some(command) = winapi::autostart_command() else { return 0 };
+    if winapi::NamedMutex::exists(crate::daemon::DAEMON_MUTEX) {
+        return 0;
+    }
+    let args = winapi::split_args(&command);
+    let Some((exe, rest)) = args.split_first() else { return 1 };
+    // Task Scheduler may keep its programs in a job; Vigil has to outlive this launcher.
+    let spawn = |flags| Command::new(exe).args(rest).creation_flags(flags).spawn();
+    match spawn(CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn(0)) {
+        Ok(_) => 0,
+        Err(_) => 1,
+    }
+}
+
+/// The helper's task: SYSTEM, at boot, never stopped for running long or for battery power,
 /// restarted if it fails.
-fn task_xml(helper: &std::path::Path) -> String {
-    let command = helper.to_string_lossy().replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+fn helper_task_xml(helper: &std::path::Path) -> String {
+    let command = xml_escape(&helper.to_string_lossy());
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -370,7 +446,7 @@ mod tests {
 
     #[test]
     fn task_runs_the_protected_copy_as_system_without_limits() {
-        let xml = task_xml(std::path::Path::new(r"C:\Program Files\Vigil & Co\vigil.exe"));
+        let xml = helper_task_xml(std::path::Path::new(r"C:\Program Files\Vigil & Co\vigil.exe"));
         for part in [
             r"<Command>C:\Program Files\Vigil &amp; Co\vigil.exe</Command>",
             "<Arguments>--process-events</Arguments>",
@@ -383,5 +459,28 @@ mod tests {
             assert!(xml.contains(part), "{part}");
         }
         assert!(helper_path().ends_with(r"Vigil\vigil.exe") && helper_path().is_absolute());
+    }
+
+    #[test]
+    fn login_task_starts_vigil_as_the_user_with_their_own_rights() {
+        let user = "S-1-5-21-1004336348-1177238915-682003330-1001";
+        let xml = login_task_xml(std::path::Path::new(r"C:\Program Files\Vigil\vigil.exe"), user);
+        for part in [
+            &format!("<LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId></LogonTrigger>"),
+            &format!("<UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel>"),
+            "<Arguments>--logon</Arguments>",
+            "<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>",
+        ] {
+            assert!(xml.contains(part), "{part}");
+        }
+        assert!(!xml.contains("HighestAvailable"));
+    }
+
+    #[test]
+    fn only_real_security_identifiers_reach_the_task() {
+        assert!(is_sid("S-1-5-21-1004336348-1177238915-682003330-1001"));
+        for bad in ["", "S-1-", "S-1-5-18</UserId><RunLevel>HighestAvailable", "s-1-5-18", "Administrator"] {
+            assert!(!is_sid(bad), "{bad}");
+        }
     }
 }

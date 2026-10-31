@@ -25,7 +25,8 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::System::Threading::*;
-use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser};
 use windows_sys::Win32::UI::Shell::{CommandLineToArgvW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
@@ -525,6 +526,32 @@ pub fn stop_process(pid: u32, command_line: &str) -> Option<bool> {
     }
 }
 
+/// The security identifier (`S-1-5-21-…`) of the account this process runs as.
+pub fn user_sid() -> Option<String> {
+    unsafe {
+        let mut token = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+        // TOKEN_USER followed by the SID it points to; u64 storage keeps it aligned.
+        let mut buf = [0u64; 32];
+        let mut len = 0;
+        let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), size_of_val(&buf) as u32, &mut len) != 0;
+        CloseHandle(token);
+        if !ok {
+            return None;
+        }
+        let user = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut text = null_mut();
+        if ConvertSidToStringSidW(user.User.Sid, &mut text) == 0 {
+            return None;
+        }
+        let sid = from_wide(std::slice::from_raw_parts(text, (0..).take_while(|&i| *text.add(i) != 0).count()));
+        LocalFree(text.cast());
+        Some(sid)
+    }
+}
+
 /// Whether this process runs with admin rights (elevated).
 pub fn is_elevated() -> bool {
     unsafe {
@@ -654,7 +681,12 @@ const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "Vigil";
 
 pub fn autostart_enabled() -> bool {
-    reg_get_string(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE).is_some()
+    autostart_command().is_some()
+}
+
+/// The command Vigil's autostart entry runs, while autostart is on.
+pub fn autostart_command() -> Option<String> {
+    reg_get_string(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE)
 }
 
 pub fn set_autostart(enabled: bool) -> bool {
@@ -739,6 +771,13 @@ mod tests {
         assert_eq!(process_args(me), Some(std::env::args().collect()));
         // Only the process still running the scanned command is stopped.
         assert_eq!(stop_process(me, "some other command"), None);
+    }
+
+    #[test]
+    fn reads_this_accounts_security_identifier() {
+        let sid = user_sid().unwrap();
+        let whoami = Command::new("whoami").args(["/user", "/fo", "csv", "/nh"]).output().unwrap();
+        assert!(String::from_utf8_lossy(&whoami.stdout).contains(&format!("\"{sid}\"")), "{sid}");
     }
 
     #[test]

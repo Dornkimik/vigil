@@ -788,9 +788,9 @@ impl App {
         let mut admin_on = self.admin_on;
         let admin_desc = match (self.admin_change.is_some(), self.admin_on, self.status.admin_mode) {
             (true, ..) => "Waiting for admin approval...",
-            (_, true, true) => "On: every program is checked the instant it starts. A small helper runs as SYSTEM; scanning stays without admin rights.",
+            (_, true, true) => "On: every program is checked the instant it starts, and Vigil starts at login even when Windows skips its startup programs. A small helper runs as SYSTEM; scanning stays without admin rights.",
             (_, true, false) => "On, but the helper is not connected yet. It starts with Windows.",
-            _ => "Check every program the instant it starts instead of within a second. Asks for admin approval once; a small helper then runs as SYSTEM.",
+            _ => "Check every program the instant it starts instead of within a second, and start Vigil at login even when Windows skips its startup programs. Asks for admin approval once; a small helper then runs as SYSTEM.",
         };
         let mut admin_toggled = false;
         card().show(ui, |ui| {

@@ -364,7 +364,10 @@ impl Engine {
         }
         // The caller picks argv[0] freely; rules see the program that really runs.
         let text = format!("{host} {}", cmdline::arguments(line));
-        let (score, findings) = self.analyze(cmdline::script_name(&host), text.as_bytes(), Kind::Script, 0, true);
+        // No YARA: its PowerShell rules flag encoded commands as such, and developer tools
+        // (VS Code, Claude Code, management agents) pass every command encoded. The string
+        // rules decode the command and judge what it does instead.
+        let (score, findings) = self.analyze(cmdline::script_name(&host), text.as_bytes(), Kind::Script, 0, false);
         r.score = score.max(0);
         r.verdict = Verdict::from_score(r.score);
         r.findings = findings;

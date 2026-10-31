@@ -11,6 +11,7 @@
 //!   vigil.exe --update-yara   download and compile the YARA Forge rules now
 //!   vigil.exe --admin-mode on|off  turn admin mode on or off (asks for admin approval)
 //!   vigil.exe --process-events     admin mode's helper, run as SYSTEM by its scheduled task
+//!   vigil.exe --logon              start Vigil as its autostart entry says (admin mode's login task)
 
 mod admin;
 mod config;
@@ -35,6 +36,7 @@ fn main() {
         Some("--update-yara") => std::process::exit(cli_update_yara()),
         Some("--admin-mode") => std::process::exit(admin::cli(&args[1..])),
         Some("--process-events") => std::process::exit(admin::run_helper()),
+        Some("--logon") => std::process::exit(admin::logon()),
         _ if winapi::NamedMutex::exists(daemon::DAEMON_MUTEX) => gui::run(),
         _ => daemon::run(true),
     }
