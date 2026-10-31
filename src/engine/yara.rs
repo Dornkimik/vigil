@@ -139,11 +139,17 @@ impl Yara {
                 findings.push(Finding::new(format!("yara.{name}"), title, weight));
             }
         }
-        findings.sort_by_key(|f| -f.weight);
-        for f in findings.iter_mut().skip(1) {
-            f.weight = f.weight.min(EXTRA_MATCH);
-        }
+        cap_extra_matches(&mut findings, false);
         findings
+    }
+}
+
+/// Every match after the strongest one adds only [`EXTRA_MATCH`]. `counted` means a
+/// stronger match was already counted elsewhere, so the first one is capped too.
+pub(crate) fn cap_extra_matches(findings: &mut [Finding], counted: bool) {
+    findings.sort_by_key(|f| -f.weight);
+    for f in findings.iter_mut().skip(if counted { 0 } else { 1 }) {
+        f.weight = f.weight.min(EXTRA_MATCH);
     }
 }
 

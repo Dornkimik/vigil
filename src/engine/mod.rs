@@ -5,6 +5,7 @@ pub mod archive;
 mod deobfuscate;
 pub mod filetype;
 pub mod hashdb;
+pub mod memory;
 pub mod pe;
 pub mod rules;
 #[cfg(test)]
@@ -358,13 +359,7 @@ impl Engine {
             if yara {
                 findings.extend(self.yara.scan(data));
             }
-            for m in matches {
-                let shown: Vec<&str> = m.matched.iter().take(4).copied().collect();
-                let more = if m.matched.len() > 4 { format!(" +{} more", m.matched.len() - 4) } else { String::new() };
-                let recovered = if m.decoded { " (recovered from encoded/obfuscated text)" } else { "" };
-                let title = format!("{}{recovered} [{}{more}]", m.rule.desc, shown.join(", "));
-                findings.push(Finding::new(format!("rule.{}", m.rule.id), title, m.rule.weight));
-            }
+            findings.extend(matches.iter().map(rule_finding));
             browser_engine = kind == Kind::Pe
                 && data.len() >= BROWSER_ENGINE_SIZE
                 && findings.iter().any(|f| f.id == "rule.info.chromium_engine")
@@ -386,6 +381,53 @@ impl Engine {
             _ => {}
         }
         (findings.iter().map(|f| f.weight).sum(), findings)
+    }
+
+    /// Findings in a running program's memory that its file scan (`file`) didn't already
+    /// make. Structure checks are left out: memory layout says nothing about packing.
+    pub fn scan_memory(&self, file: &[Finding], blocks: &[memory::Block]) -> Vec<Finding> {
+        let in_file = |id: &str| file.iter().any(|f| f.id == id);
+        let mut found = Vec::new();
+        let mut yara = Vec::new();
+        for block in blocks {
+            match block.kind {
+                memory::BlockKind::Replaced => found.push(Finding::new(
+                    "memory.hollowed",
+                    "The program's code was replaced in memory after it started (process hollowing)",
+                    60,
+                )),
+                memory::BlockKind::Private if pe::native_header(&block.data) => found.push(Finding::new(
+                    "memory.unbacked_program",
+                    "Runs a program loaded straight into memory, with no file behind it",
+                    25,
+                )),
+                _ => {}
+            }
+            found.extend(self.rules.scan(&block.data, Scope::Pe).iter().map(rule_finding));
+            yara.extend(self.yara.scan(&block.data));
+        }
+        // Several blocks can match the same rule; the strongest match counts.
+        yara.sort_by_key(|f| -f.weight);
+        found.append(&mut yara);
+        let mut seen = HashSet::new();
+        found.retain(|f| seen.insert(f.id.clone()) && !in_file(&f.id) && f.id != "rule.info.chromium_engine");
+        if in_file("rule.info.chromium_engine") {
+            found.retain(|f| !BROWSER_ENGINE_EXPECTED.contains(&f.id.as_str()));
+        }
+        let (mut yara, mut found): (Vec<_>, Vec<_>) = found.into_iter().partition(|f| f.id.starts_with("yara."));
+        yara::cap_extra_matches(&mut yara, file.iter().any(|f| f.id.starts_with("yara.") && f.weight > 0));
+        found.append(&mut yara);
+        for f in &mut found {
+            if f.id.starts_with("rule.") || f.id.starts_with("yara.") {
+                f.title = format!("In memory: {}", f.title);
+            }
+        }
+        // What memory revealed can complete a combination the file only showed half of.
+        let mut all: Vec<Finding> = file.iter().chain(&found).cloned().collect();
+        let before = all.len();
+        correlate(&mut all);
+        found.extend(all.drain(before..).filter(|f| !in_file(&f.id)));
+        found
     }
 
     /// Optional hash lookup on abuse.ch MalwareBazaar. Only the SHA-256 leaves the machine.
@@ -428,6 +470,14 @@ fn name_findings(name: &str, kind: Kind, source: Source, downloaded: bool) -> Ve
         findings.push(Finding::new("steam.workshop_code", "Steam Workshop item ships executable code", 10));
     }
     findings
+}
+
+fn rule_finding(m: &rules::RuleMatch) -> Finding {
+    let shown: Vec<&str> = m.matched.iter().take(4).copied().collect();
+    let more = if m.matched.len() > 4 { format!(" +{} more", m.matched.len() - 4) } else { String::new() };
+    let recovered = if m.decoded { " (recovered from encoded/obfuscated text)" } else { "" };
+    let title = format!("{}{recovered} [{}{more}]", m.rule.desc, shown.join(", "));
+    Finding::new(format!("rule.{}", m.rule.id), title, m.rule.weight)
 }
 
 fn malwarebazaar_finding(family: &str) -> Finding {

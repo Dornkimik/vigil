@@ -6,7 +6,7 @@ pub mod tray;
 
 use crate::config::{self, Config};
 use crate::engine::filetype::{TEMP_EXTS, ext_of};
-use crate::engine::{Engine, Report, ScanOptions, Source, Verdict, hashdb, yara};
+use crate::engine::{Engine, Report, ScanOptions, Source, Verdict, hashdb, memory, yara};
 use crate::store::{self, Action, Event, Status, WatchedDir};
 use crate::{steam, winapi};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -23,6 +23,11 @@ pub const DAEMON_MUTEX: &str = r"Local\Vigil.Daemon";
 /// Wait this long after the last change before scanning, so downloads/installs finish first.
 const SETTLE: Duration = Duration::from_secs(2);
 const MAX_RETRIES: u32 = 40;
+/// When a started program's memory is checked, counted from its start. Packers unpack
+/// within milliseconds; the second look catches loaders that wait before they decrypt.
+const MEMORY_PASSES: [Duration; 2] = [Duration::from_secs(5), Duration::from_secs(60)];
+/// File findings that mean the program unpacks itself, so its image in memory differs from its file.
+const PACKED: &[&str] = &["pe.packer", "pe.high_entropy", "pe.few_imports", "pe.rwx"];
 
 pub struct Shared {
     pub config: RwLock<Config>,
@@ -42,6 +47,9 @@ pub enum Work {
     /// The image of a program that just started, or a DLL that rundll32/regsvr32 runs.
     /// Scanned right away, ahead of other work.
     Launched(PathBuf),
+    /// A program that just started, by process ID. Its memory is checked once it has had
+    /// time to unpack itself.
+    Started(u32, PathBuf),
 }
 
 pub fn run(open_gui: bool) {
@@ -221,18 +229,39 @@ struct Pending {
     launched: bool,
 }
 
+struct MemoryScan {
+    pid: u32,
+    path: PathBuf,
+    started: Instant,
+    /// Index into [`MEMORY_PASSES`].
+    pass: usize,
+}
+
+type FileKey = (u64, Option<SystemTime>);
+
 struct Worker {
     shared: Arc<Shared>,
     rx: Receiver<Work>,
     pending: HashMap<PathBuf, Pending>,
     /// path -> (size, mtime) of files already scanned, so Steam's churn doesn't trigger rescans.
-    seen: HashMap<PathBuf, (u64, Option<SystemTime>)>,
+    seen: HashMap<PathBuf, FileKey>,
+    /// Latest report for each program that started, which its memory scans build on.
+    launches: HashMap<PathBuf, (FileKey, Report)>,
+    memory: Vec<MemoryScan>,
     data_dir: PathBuf,
 }
 
 fn worker(shared: Arc<Shared>, rx: Receiver<Work>) {
     winapi::set_background_priority();
-    let mut w = Worker { shared, rx, pending: HashMap::new(), seen: HashMap::new(), data_dir: config::data_dir() };
+    let mut w = Worker {
+        shared,
+        rx,
+        pending: HashMap::new(),
+        seen: HashMap::new(),
+        launches: HashMap::new(),
+        memory: Vec::new(),
+        data_dir: config::data_dir(),
+    };
     loop {
         match w.rx.recv_timeout(Duration::from_millis(500)) {
             Ok(work) => w.enqueue(work),
@@ -255,11 +284,15 @@ fn worker(shared: Arc<Shared>, rx: Receiver<Work>) {
             w.process(&path, p);
             w.scan_launches();
         }
+        w.scan_memory();
         if w.pending.is_empty() {
             *w.shared.current.lock().unwrap() = None;
         }
         if w.seen.len() > 200_000 {
             w.seen.clear();
+        }
+        if w.launches.len() > 10_000 {
+            w.launches.clear();
         }
     }
 }
@@ -267,6 +300,10 @@ fn worker(shared: Arc<Shared>, rx: Receiver<Work>) {
 impl Worker {
     fn enqueue(&mut self, work: Work) {
         let (path, source, force, launched) = match work {
+            Work::Started(pid, path) => {
+                self.memory.push(MemoryScan { pid, path, started: Instant::now(), pass: 0 });
+                return;
+            }
             Work::Changed(p, s) => (p, s, false, false),
             Work::Scan(p, s) => (p, s, true, false),
             Work::Launched(p) => (p, Source::Launch, false, true),
@@ -298,6 +335,62 @@ impl Worker {
                 self.process(&path, p);
             }
         }
+        self.scan_memory();
+    }
+
+    /// Checks the memory of programs that started a while ago.
+    fn scan_memory(&mut self) {
+        if self.memory.is_empty() || self.shared.config.read().unwrap().paused {
+            return;
+        }
+        let now = Instant::now();
+        let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.memory).into_iter().partition(|m| m.started + MEMORY_PASSES[m.pass] <= now);
+        self.memory = waiting;
+        for scan in due {
+            if self.scan_process(&scan) && scan.pass + 1 < MEMORY_PASSES.len() {
+                self.memory.push(MemoryScan { pass: scan.pass + 1, ..scan });
+            }
+        }
+    }
+
+    /// Checks one program's memory against what its file scan found. Returns whether
+    /// it is worth another look later.
+    fn scan_process(&mut self, scan: &MemoryScan) -> bool {
+        // The file scan comes first; it may still be waiting for the file to unlock.
+        let Some((_, file)) = self.launches.get(&scan.path) else { return true };
+        // Signed programs get the same pass as for YARA on files. Malicious ones were
+        // already stopped, and the user vouched for allowlisted ones.
+        if file.signer.is_some() || file.verdict == Verdict::Malicious || file.findings.iter().any(|f| f.id == "allowlist") {
+            return false;
+        }
+        // Elevated programs can't be read, and the program may have exited already.
+        let Some(process) = winapi::ProcessMemory::open(scan.pid) else { return false };
+        // The process ID may belong to another program by now.
+        let same = process.image().map(procwatch::long_path).is_some_and(|p| p.as_os_str().eq_ignore_ascii_case(scan.path.as_os_str()));
+        if !same {
+            return false;
+        }
+        *self.shared.current.lock().unwrap() = Some(format!("{} (memory)", scan.path.display()));
+        let packed = file.findings.iter().any(|f| PACKED.contains(&f.id.as_str()));
+        let blocks = memory::read(&process, packed);
+        drop(process);
+        let engine = self.shared.engine.read().unwrap().clone();
+        let found = engine.scan_memory(&file.findings, &blocks);
+        if found.is_empty() {
+            return true;
+        }
+        let mut report = file.clone();
+        report.score += found.iter().map(|f| f.weight).sum::<i32>();
+        report.findings.extend(found);
+        let raised = Verdict::from_score(report.score) > report.verdict;
+        report.verdict = Verdict::from_score(report.score);
+        if let Some((_, stored)) = self.launches.get_mut(&scan.path) {
+            *stored = report.clone();
+        }
+        if raised {
+            handle_report(&self.shared, report, Source::Launch, true);
+        }
+        true
     }
 
     fn process(&mut self, path: &Path, p: Pending) {
@@ -337,7 +430,9 @@ impl Worker {
             return Ok(());
         }
         let key = (meta.len(), meta.modified().ok());
-        if !force && self.seen.get(path) == Some(&key) {
+        // A started program needs its report for the memory scans that follow.
+        let have_report = !launched || self.launches.get(path).is_some_and(|(k, _)| *k == key);
+        if !force && self.seen.get(path) == Some(&key) && have_report {
             return Ok(());
         }
         let source = steam::source_for(path, source);
@@ -348,6 +443,9 @@ impl Worker {
         let report = engine.scan_file(path, opts)?;
         self.seen.insert(path.to_path_buf(), key);
         if report.analyzed {
+            if launched {
+                self.launches.insert(path.to_path_buf(), (key, report.clone()));
+            }
             self.shared.scanned.fetch_add(1, Ordering::Relaxed);
             handle_report(&self.shared, report, source, launched);
         }

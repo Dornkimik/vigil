@@ -122,6 +122,30 @@ pub fn image_end(data: &[u8]) -> usize {
     sections.chain(cert).max().unwrap_or(data.len()).clamp(4096.min(data.len()), data.len())
 }
 
+/// Whether `data` starts with the headers of a native program or DLL. .NET assemblies
+/// don't count: the .NET runtime itself loads some of them into private memory.
+/// Only the headers are read, so this works on images in memory layout too.
+pub fn native_header(data: &[u8]) -> bool {
+    let u16_at = |o: usize| data.get(o..o + 2).map(|b| u16::from_le_bytes([b[0], b[1]]));
+    let u32_at = |o: usize| data.get(o..o + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    if !data.starts_with(b"MZ") {
+        return false;
+    }
+    let Some(pe) = u32_at(0x3C).map(|o| o as usize) else { return false };
+    if data.get(pe..pe + 4) != Some(b"PE\0\0") {
+        return false;
+    }
+    let optional = pe + 24;
+    let (count, dirs) = match u16_at(optional) {
+        Some(0x10B) => (optional + 92, optional + 96),
+        Some(0x20B) => (optional + 108, optional + 112),
+        _ => return false,
+    };
+    // Data directory 14 points to the .NET runtime header.
+    let clr = u32_at(count).is_some_and(|n| n > 14) && u32_at(dirs + 14 * 8).is_some_and(|rva| rva != 0);
+    !clr
+}
+
 /// Counts x64 `mov r10, rcx; mov eax, <number>` stubs followed by `syscall` or a jump
 /// into ntdll. Outside ntdll these mean the program calls the kernel itself.
 fn syscall_stubs(code: &[u8]) -> usize {
@@ -206,7 +230,7 @@ pub fn entropy(data: &[u8]) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Two x64 syscall stubs, as SysWhispers-style tools emit them.
@@ -214,6 +238,33 @@ mod tests {
         0x4C, 0x8B, 0xD1, 0xB8, 0x18, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xC3, // NtAllocateVirtualMemory
         0x4C, 0x8B, 0xD1, 0xB8, 0x3A, 0x00, 0x00, 0x00, 0x0F, 0x05, 0xC3, // NtWriteVirtualMemory
     ];
+
+    /// Headers of a PE32+ image, optionally with a .NET runtime header.
+    pub(crate) fn headers(dotnet: bool) -> Vec<u8> {
+        let mut h = vec![0u8; 0x200];
+        h[..2].copy_from_slice(b"MZ");
+        h[0x3C] = 0x80;
+        h[0x80..0x84].copy_from_slice(b"PE\0\0");
+        let optional = 0x80 + 24;
+        h[optional..optional + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        h[optional + 108] = 16;
+        if dotnet {
+            h[optional + 112 + 14 * 8] = 0x08;
+            h[optional + 112 + 14 * 8 + 1] = 0x20;
+        }
+        h
+    }
+
+    #[test]
+    fn tells_native_programs_from_dotnet_ones() {
+        assert!(native_header(&headers(false)));
+        assert!(!native_header(&headers(true)));
+        assert!(!native_header(b"MZ but nothing more"));
+        assert!(!native_header(&[0u8; 0x200]));
+        let mut truncated = headers(false);
+        truncated.truncate(0x90);
+        assert!(!native_header(&truncated));
+    }
 
     #[test]
     fn counts_direct_syscall_stubs() {

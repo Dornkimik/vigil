@@ -15,6 +15,8 @@ malware gets onto a gaming PC, plus a safety net for programs that arrive any ot
   `rundll32.exe` and `regsvr32.exe` are Windows' own but run any DLL they are given, so the
   DLL they are told to run, and every DLL from outside the Windows folder they load, is
   checked too. A malicious one is stopped together with the process hosting it.
+  Unsigned programs also get their **memory** checked a few seconds after they start, where
+  packed and encrypted malware has to show its real code.
 
 ## How it works
 
@@ -71,16 +73,27 @@ shows every finding that added to the score.
    they leave the signature valid. Programs padded to hundreds of MB to dodge AV size limits
    are flagged, and when the padding pushes them past the 512 MB content limit, the code
    before the padding is still analyzed.
-4. **Disguise tricks**: `invoice.pdf.exe`, right-to-left-override filenames, programs
+4. **Memory of started programs**: malware that is packed or encrypted on disk looks harmless
+   to every check above, but it has to decrypt itself in memory before it can run. Five seconds
+   and again one minute after an unsigned program starts, Vigil reads its private memory that can
+   run code (where injected code, shellcode and payloads loaded without a file end up) and, when
+   the file looked packed, the program's own unpacked image. The string rules and YARA rules run
+   over it, and only evidence the file scan didn't already show adds to the file's score, marked
+   *In memory*. A native program loaded straight into memory with no file behind it adds 25
+   points, and a program whose own code was replaced after it started (process hollowing) adds 60.
+   At most 64 MB is read per process, nothing is written to it, and elevated programs are left
+   out because reading them would need admin rights. Programs that unpack in steps and only
+   decrypt strings while they use them, or that wait longer than a minute, can still get past it.
+5. **Disguise tricks**: `invoice.pdf.exe`, right-to-left-override filenames, programs
    renamed to `.jpg`, extensions hidden behind padding spaces, Windows system program names
    (`svchost.exe`, `lsass.exe`…) outside the Windows folder, shortcut (`.lnk`) droppers,
    ISO/IMG containers, macro-enabled Office files.
-5. **Archives**: password-protected ZIPs that hide programs (a classic way past scanners).
+6. **Archives**: password-protected ZIPs that hide programs (a classic way past scanners).
    Programs and scripts inside ZIPs are unpacked in memory and scanned.
-6. **Authenticode**: a valid signature removes 60% of the heuristic score, unless an
+7. **Authenticode**: a valid signature removes 60% of the heuristic score, unless an
    encrypted payload is hidden inside the signature block. Broken or untrusted signatures
    add to it.
-7. **Known-malware hashes (optional)**: add a free [abuse.ch MalwareBazaar](https://auth.abuse.ch/)
+8. **Known-malware hashes (optional)**: add a free [abuse.ch MalwareBazaar](https://auth.abuse.ch/)
    key in Settings. Vigil downloads MalwareBazaar's full hash export once (refreshed monthly)
    and merges in the 48-hour export twice a day. Every file, signed or not, and every program
    inside a ZIP, is checked offline against this database. No hashes are sent anywhere. The
@@ -88,7 +101,7 @@ shows every finding that added to the score.
    costs almost no RAM. Until the first download finishes, unsigned files are looked up online
    instead. `vigil.exe --update-hashes` forces an update. You can also put your own SHA-256
    blocklist in `%LOCALAPPDATA%\Vigil\blocklist.txt`.
-8. **YARA rules**: the [YARA Forge](https://github.com/YARAHQ/yara-forge) *core* package
+9. **YARA rules**: the [YARA Forge](https://github.com/YARAHQ/yara-forge) *core* package
    (about 5,000 curated rules from public repositories) is downloaded from GitHub once a week
    and matched offline with [YARA-X](https://github.com/VirusTotal/yara-x). Many of these rules
    match a malware family's code rather than its text, so they still recognize samples whose
@@ -102,7 +115,7 @@ shows every finding that added to the score.
    share with malware. The package is compiled in memory and only the compiled, XOR-encoded rules
    are stored (`yara-*.bin`, about 9 MB). `vigil.exe --update-yara` forces an update. Updates can
    be turned off in Settings.
-9. **Defender cross-check**: the *Ask Defender* button sends a single file to
+10. **Defender cross-check**: the *Ask Defender* button sends a single file to
    `MpCmdRun.exe` for a second opinion. Defender does not remediate during this check.
 
 Malicious files are quarantined automatically (configurable). If the file is a program that is

@@ -479,3 +479,79 @@ fn system_program_names_outside_windows_are_impostors() {
     assert!(!impostor(r"C:\Windows\explorer.exe"));
     assert!(!impostor(r"C:\Users\me\Downloads\setup.exe"));
 }
+
+fn yara_engine() -> Engine {
+    let zip = yara::tests::package(&[("rules.yar", yara::tests::RULES)]);
+    let (rules, _, _) = yara::compile_package(&zip).unwrap();
+    let mut engine = engine();
+    engine.yara = yara::Yara::from_package(rules);
+    engine
+}
+
+fn block(kind: memory::BlockKind, data: &[u8]) -> memory::Block {
+    memory::Block { kind, data: data.to_vec() }
+}
+
+#[test]
+fn memory_shows_what_packing_hid() {
+    let engine = yara_engine();
+    // On disk the program only looked packed and named a webhook.
+    let file = [
+        Finding::new("pe.packer", "Packed", 10),
+        Finding::new("sig.unsigned", "Not signed", 5),
+        Finding::new("rule.stealer.exfil_channel", "Webhook", 20),
+    ];
+    let unpacked = br"MZ dQw4w9WgXcQ: \discord\Local Storage\leveldb discord.com/api/webhooks/ VIGIL-YARA-GENERIC-MARKER";
+    let found = engine.scan_memory(&file, &[block(memory::BlockKind::Image, unpacked)]);
+    let ids: Vec<&str> = found.iter().map(|f| f.id.as_str()).collect();
+    assert!(ids.contains(&"rule.stealer.discord_tokens"), "{found:?}");
+    assert!(ids.contains(&"yara.TEST_SUSP_Marker_Generic"), "{found:?}");
+    // Tokens from memory plus the webhook from the file complete the combination.
+    assert!(ids.contains(&"behavior.theft_exfil"), "{found:?}");
+    // What the file scan already counted doesn't count twice.
+    assert!(!ids.contains(&"rule.stealer.exfil_channel"), "{found:?}");
+    assert!(found.iter().filter(|f| !f.id.starts_with("behavior.")).all(|f| f.title.starts_with("In memory: ")));
+    let score: i32 = file.iter().chain(&found).map(|f| f.weight).sum();
+    assert!(score >= MALICIOUS, "{score} {found:?}");
+
+    // An image with nothing new in it adds nothing.
+    assert!(engine.scan_memory(&file, &[block(memory::BlockKind::Image, b"MZ discord.com/api/webhooks/")]).is_empty());
+}
+
+#[test]
+fn memory_flags_code_without_a_file() {
+    let engine = yara_engine();
+    let mut native = pe::tests::headers(false);
+    native.extend_from_slice(b"VIGIL-YARA-FAMILY-MARKER");
+    let blocks = [
+        block(memory::BlockKind::Private, &native),
+        block(memory::BlockKind::Private, &native),
+        // The .NET runtime loads some assemblies into private memory itself.
+        block(memory::BlockKind::Private, &pe::tests::headers(true)),
+        block(memory::BlockKind::Replaced, b"MZ"),
+        // JIT code and shellcode without headers.
+        block(memory::BlockKind::Private, &[0xCC; 64]),
+    ];
+    let found = engine.scan_memory(&[], &blocks);
+    let weight = |id: &str| found.iter().filter(|f| f.id == id).map(|f| f.weight).collect::<Vec<_>>();
+    assert_eq!(weight("memory.unbacked_program"), [25]);
+    assert_eq!(weight("memory.hollowed"), [60]);
+    assert_eq!(weight("yara.TEST_Win_Marker_Family"), [80]);
+    assert!(engine.scan_memory(&[], &[block(memory::BlockKind::Private, &pe::tests::headers(true))]).is_empty());
+
+    // After a YARA match in the file, more matches only add a little.
+    let file = [Finding::new("yara.TEST_SUSP_Marker_Generic", "Generic", 35)];
+    let found = engine.scan_memory(&file, &blocks[..1]);
+    assert_eq!(found.iter().find(|f| f.id == "yara.TEST_Win_Marker_Family").map(|f| f.weight), Some(5));
+}
+
+#[test]
+fn memory_of_browser_engines_keeps_their_allowances() {
+    let engine = engine();
+    let chromium = r"\Login Data \Local State encrypted_key CryptUnprotectData \Google\Chrome\User Data \Microsoft\Edge\User Data \BraveSoftware\Brave-Browser";
+    let blocks = [block(memory::BlockKind::Private, chromium.as_bytes())];
+    let plain = engine.scan_memory(&[], &blocks);
+    assert!(plain.iter().any(|f| BROWSER_ENGINE_EXPECTED.contains(&f.id.as_str())), "{plain:?}");
+    let electron = engine.scan_memory(&[Finding::new("rule.info.chromium_engine", "Chromium", 0)], &blocks);
+    assert!(!electron.iter().any(|f| BROWSER_ENGINE_EXPECTED.contains(&f.id.as_str())), "{electron:?}");
+}

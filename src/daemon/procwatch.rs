@@ -5,6 +5,9 @@
 //! `rundll32.exe` and `regsvr32.exe` are Windows' own, but run whatever DLL they are
 //! given, so for them the DLLs come next: the one named on the command line, and every
 //! DLL from outside the Windows folder they load while they run.
+//!
+//! Each program is also reported with its process ID, so its memory can be checked
+//! once it has had time to unpack itself.
 
 use super::{Shared, Work};
 use crate::engine::filetype;
@@ -42,25 +45,26 @@ pub fn run(shared: Arc<Shared>, tx: Sender<Work>) {
                     // The command line still names the DLL if the host exits before it is inspected.
                     let named = winapi::process_args(pid).map(|args| hosted_dlls(&image, &args)).unwrap_or_default();
                     let named: HashSet<PathBuf> = named.into_iter().map(long_path).collect();
-                    queue.extend(named.iter().filter(|dll| !is_system(dll, &system_root)).cloned());
+                    queue.extend(named.iter().filter(|dll| !is_system(dll, &system_root)).cloned().map(Work::Launched));
                     hosts.insert(pid, named);
                 }
                 if is_system(&image, &system_root) || own_exe.as_ref().is_some_and(|e| e.as_os_str().eq_ignore_ascii_case(image.as_os_str())) {
                     continue;
                 }
-                queue.push(image);
+                queue.push(Work::Launched(image.clone()));
+                queue.push(Work::Started(pid, image));
             }
             // DLLs load after the host starts, so hosts are re-checked on every pass while they run.
             hosts.retain(|pid, _| current.contains(pid));
             for (&pid, queued) in &mut hosts {
                 for module in winapi::process_modules(pid).into_iter().map(long_path) {
                     if !is_system(&module, &system_root) && queued.insert(module.clone()) {
-                        queue.push(module);
+                        queue.push(Work::Launched(module));
                     }
                 }
             }
-            for path in queue {
-                if tx.send(Work::Launched(path)).is_err() {
+            for work in queue {
+                if tx.send(work).is_err() {
                     return;
                 }
             }
@@ -107,7 +111,7 @@ fn hosted_dlls(image: &Path, args: &[String]) -> Vec<PathBuf> {
 }
 
 /// Expands 8.3 short names (`REGIST~1`) so they can't slip past the folder check.
-fn long_path(image: PathBuf) -> PathBuf {
+pub(super) fn long_path(image: PathBuf) -> PathBuf {
     if !image.to_string_lossy().contains('~') {
         return image;
     }

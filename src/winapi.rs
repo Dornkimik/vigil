@@ -12,9 +12,14 @@ use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::Cryptography::{CERT_NAME_SIMPLE_DISPLAY_TYPE, CertGetNameStringW};
 use windows_sys::Win32::Security::WinTrust::*;
 use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32W, Process32FirstW, Process32NextW,
     TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
+};
+use windows_sys::Win32::System::Memory::{
+    MEM_COMMIT, MEM_IMAGE, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
+    PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, VirtualQueryEx,
 };
 use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::System::Threading::*;
@@ -237,6 +242,11 @@ pub fn process_args(pid: u32) -> Option<Vec<String>> {
 /// Files of the modules (the program and its DLLs) loaded into a process. Empty for
 /// processes we may not inspect (elevated, protected) or that already exited.
 pub fn process_modules(pid: u32) -> Vec<PathBuf> {
+    module_entries(pid).into_iter().map(|(path, ..)| path).collect()
+}
+
+/// File, base address and size of each module, the program itself first.
+fn module_entries(pid: u32) -> Vec<(PathBuf, usize, usize)> {
     let mut modules = Vec::new();
     unsafe {
         // Fails with ERROR_BAD_LENGTH while the process is still loading modules.
@@ -254,12 +264,100 @@ pub fn process_modules(pid: u32) -> Vec<PathBuf> {
         entry.dwSize = size_of::<MODULEENTRY32W>() as u32;
         let mut ok = Module32FirstW(snap, &mut entry);
         while ok != 0 {
-            modules.push(PathBuf::from(from_wide(&entry.szExePath)));
+            modules.push((PathBuf::from(from_wide(&entry.szExePath)), entry.modBaseAddr as usize, entry.modBaseSize as usize));
             ok = Module32NextW(snap, &mut entry);
         }
         CloseHandle(snap);
     }
     modules
+}
+
+/// A committed range of another process's address space with the same protection.
+#[derive(Clone, Copy, Debug)]
+pub struct Region {
+    pub base: usize,
+    pub size: usize,
+    /// Start of the allocation the range belongs to.
+    pub allocation: usize,
+    /// Mapped from a program or DLL file.
+    pub image: bool,
+    /// Not backed by any file.
+    pub private: bool,
+    pub executable: bool,
+    pub readable: bool,
+}
+
+/// Read access to another process's memory. Works without admin rights for the user's
+/// own processes, but not for elevated or protected ones.
+pub struct ProcessMemory {
+    handle: HANDLE,
+    pid: u32,
+}
+
+impl ProcessMemory {
+    pub fn open(pid: u32) -> Option<Self> {
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid) };
+        (!handle.is_null()).then_some(Self { handle, pid })
+    }
+
+    /// The program the process runs.
+    pub fn image(&self) -> Option<PathBuf> {
+        unsafe { image_of(self.handle) }
+    }
+
+    /// Base address and size of the program's own image, where the loader mapped it.
+    pub fn main_module(&self) -> Option<(usize, usize)> {
+        module_entries(self.pid).first().map(|&(_, base, size)| (base, size))
+    }
+
+    pub fn regions(&self) -> Vec<Region> {
+        const EXECUTE: u32 = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        let mut regions = Vec::new();
+        let mut address = 0usize;
+        loop {
+            let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+            let n = unsafe { VirtualQueryEx(self.handle, address as *const c_void, &mut info, size_of::<MEMORY_BASIC_INFORMATION>()) };
+            if n == 0 {
+                break;
+            }
+            let (base, size) = (info.BaseAddress as usize, info.RegionSize);
+            if info.State == MEM_COMMIT {
+                regions.push(Region {
+                    base,
+                    size,
+                    allocation: info.AllocationBase as usize,
+                    image: info.Type == MEM_IMAGE,
+                    private: info.Type == MEM_PRIVATE,
+                    executable: info.Protect & EXECUTE != 0,
+                    readable: info.Protect != 0 && info.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0,
+                });
+            }
+            match base.checked_add(size) {
+                Some(next) if next > address => address = next,
+                _ => break,
+            }
+        }
+        regions
+    }
+
+    /// Up to `len` bytes at `base`, or `None` when the range can't be read.
+    pub fn read(&self, base: usize, len: usize) -> Option<Vec<u8>> {
+        let mut buf = vec![0u8; len];
+        let mut read = 0;
+        let ok = unsafe { ReadProcessMemory(self.handle, base as *const c_void, buf.as_mut_ptr().cast(), len, &mut read) };
+        (ok != 0 && read > 0).then(|| {
+            buf.truncate(read);
+            buf
+        })
+    }
+}
+
+impl Drop for ProcessMemory {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.handle);
+        }
+    }
 }
 
 /// Ends every process running `file`, or, when none runs it, every process that has it
