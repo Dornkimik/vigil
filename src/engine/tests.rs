@@ -420,6 +420,8 @@ fn broken_signatures_only_ignored_while_steam_is_still_downloading() {
     // Certificate trust doesn't depend on the file being complete.
     let untrusted = Signature::Invalid(InvalidReason::Untrusted);
     assert_eq!(ids(untrusted, Source::SteamDownload).as_deref(), Some("sig.untrusted"));
+    let revoked = Signature::Invalid(InvalidReason::Revoked);
+    assert_eq!(ids(revoked, Source::SteamDownload).as_deref(), Some("sig.revoked"));
 }
 
 #[test]
@@ -554,4 +556,62 @@ fn memory_of_browser_engines_keeps_their_allowances() {
     assert!(plain.iter().any(|f| BROWSER_ENGINE_EXPECTED.contains(&f.id.as_str())), "{plain:?}");
     let electron = engine.scan_memory(&[Finding::new("rule.info.chromium_engine", "Chromium", 0)], &blocks);
     assert!(!electron.iter().any(|f| BROWSER_ENGINE_EXPECTED.contains(&f.id.as_str())), "{electron:?}");
+}
+
+/// A ZIP whose central directory lists the same deflated member `entries` times.
+fn overlapping_zip(entries: usize, member: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut deflate = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+    deflate.write_all(member).unwrap();
+    let packed = deflate.finish().unwrap();
+    let mut crc = flate2::Crc::new();
+    crc.update(member);
+    let sizes = [crc.sum(), packed.len() as u32, member.len() as u32];
+    let mut zip = vec![0x50, 0x4B, 3, 4, 20, 0, 0, 0, 8, 0, 0, 0, 0, 0];
+    sizes.iter().for_each(|v| zip.extend(v.to_le_bytes()));
+    zip.extend([5, 0, 0, 0]);
+    zip.extend(b"a.exe");
+    zip.extend(&packed);
+    let directory = zip.len();
+    for i in 0..entries {
+        let name = format!("a{i}.exe");
+        zip.extend([0x50, 0x4B, 1, 2, 20, 0, 20, 0, 0, 0, 8, 0, 0, 0, 0, 0]);
+        sizes.iter().for_each(|v| zip.extend(v.to_le_bytes()));
+        zip.extend((name.len() as u16).to_le_bytes());
+        // Extra and comment lengths, disk, attributes, then the shared local header at offset 0.
+        zip.extend([0; 16]);
+        zip.extend(name.as_bytes());
+    }
+    let size = (zip.len() - directory) as u32;
+    zip.extend([0x50, 0x4B, 5, 6, 0, 0, 0, 0]);
+    zip.extend((entries as u16).to_le_bytes());
+    zip.extend((entries as u16).to_le_bytes());
+    zip.extend(size.to_le_bytes());
+    zip.extend((directory as u32).to_le_bytes());
+    zip.extend([0, 0]);
+    zip
+}
+
+#[test]
+fn zip_bombs_are_unpacked_once_and_within_a_budget() {
+    use std::io::{Cursor, Write};
+    let mut member = b"MZ".to_vec();
+    member.resize(8 << 20, 0);
+    let engine = engine();
+    let started = std::time::Instant::now();
+    let (_, findings) = engine.analyze_buffer("bomb.zip", &overlapping_zip(2000, &member), Kind::Zip, 0);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    assert!(findings.iter().any(|f| f.id == "zip.inspected" && f.title.contains(" 1 program")), "{findings:?}");
+
+    // Distinct members stop at the unpacking budget.
+    let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default().compression_level(Some(9));
+    for i in 0..40 {
+        zip.start_file(format!("tool{i}.exe"), options).unwrap();
+        zip.write_all(&member).unwrap();
+    }
+    let data = zip.finish().unwrap().into_inner();
+    let (_, findings) = engine.analyze_buffer("many.zip", &data, Kind::Zip, 0);
+    assert!(findings.iter().any(|f| f.id == "zip.inspected" && f.title.contains(" 32 program")), "{findings:?}");
+    assert!(findings.iter().any(|f| f.id == "zip.partial" && f.title.starts_with("8 more")), "{findings:?}");
 }

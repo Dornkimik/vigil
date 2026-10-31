@@ -53,11 +53,37 @@ pub enum InvalidReason {
     Tampered,
     /// Self-signed or otherwise untrusted certificate chain.
     Untrusted,
+    /// The certificate was revoked, typically because it was stolen and used to sign malware.
+    Revoked,
     Other(i32),
 }
 
+const CERT_E_REVOKED: u32 = 0x800B_010C;
+
 pub fn verify_signature(path: &Path) -> Signature {
     let path_w = wide(path);
+    let (status, signer) = win_verify_trust(&path_w, false);
+    match status {
+        0 => {
+            // Revocation is checked against what Windows has cached (it never goes online
+            // from a background scan), so only a confirmed revocation counts; a missing
+            // or stale revocation list leaves the signature valid.
+            if win_verify_trust(&path_w, true).0 == CERT_E_REVOKED {
+                return Signature::Invalid(InvalidReason::Revoked);
+            }
+            Signature::Valid(signer.unwrap_or_else(|| "Unknown publisher".into()))
+        }
+        0x800B_0100 | 0x800B_0003 | 0x800B_0001 => Signature::Unsigned,
+        0x8009_6010 | 0x8009_6019 => Signature::Invalid(InvalidReason::Tampered),
+        CERT_E_REVOKED => Signature::Invalid(InvalidReason::Revoked),
+        0x800B_0109 | 0x800B_010F | 0x800B_0111 => Signature::Invalid(InvalidReason::Untrusted),
+        _ => Signature::Invalid(InvalidReason::Other(status as i32)),
+    }
+}
+
+/// One WinVerifyTrust pass over a file's embedded signature. Returns the status and,
+/// when it verifies, the signer's display name.
+fn win_verify_trust(path_w: &[u16], revocation: bool) -> (u32, Option<String>) {
     unsafe {
         let mut file_info: WINTRUST_FILE_INFO = std::mem::zeroed();
         file_info.cbStruct = size_of::<WINTRUST_FILE_INFO>() as u32;
@@ -66,7 +92,7 @@ pub fn verify_signature(path: &Path) -> Signature {
         let mut data: WINTRUST_DATA = std::mem::zeroed();
         data.cbStruct = size_of::<WINTRUST_DATA>() as u32;
         data.dwUIChoice = WTD_UI_NONE;
-        data.fdwRevocationChecks = WTD_REVOKE_NONE;
+        data.fdwRevocationChecks = if revocation { WTD_REVOKE_WHOLECHAIN } else { WTD_REVOKE_NONE };
         data.dwUnionChoice = WTD_CHOICE_FILE;
         data.Anonymous.pFile = &mut file_info;
         data.dwStateAction = WTD_STATEACTION_VERIFY;
@@ -78,19 +104,12 @@ pub fn verify_signature(path: &Path) -> Signature {
             INVALID_HANDLE_VALUE as HWND,
             &mut action,
             &mut data as *mut _ as *mut c_void,
-        );
-
-        let result = match status as u32 {
-            0 => Signature::Valid(signer_name(data.hWVTStateData).unwrap_or_else(|| "Unknown publisher".into())),
-            0x800B_0100 | 0x800B_0003 | 0x800B_0001 => Signature::Unsigned,
-            0x8009_6010 | 0x8009_6019 => Signature::Invalid(InvalidReason::Tampered),
-            0x800B_0109 | 0x800B_010F | 0x800B_0111 | 0x800B_010C => Signature::Invalid(InvalidReason::Untrusted),
-            _ => Signature::Invalid(InvalidReason::Other(status)),
-        };
+        ) as u32;
+        let signer = if status == 0 && !revocation { signer_name(data.hWVTStateData) } else { None };
 
         data.dwStateAction = WTD_STATEACTION_CLOSE;
         WinVerifyTrust(INVALID_HANDLE_VALUE as HWND, &mut action, &mut data as *mut _ as *mut c_void);
-        result
+        (status, signer)
     }
 }
 

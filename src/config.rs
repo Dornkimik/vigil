@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 /// %LOCALAPPDATA%\Vigil
@@ -84,10 +85,23 @@ impl Default for Config {
 
 impl Config {
     pub fn load() -> Self {
-        std::fs::read(config_path())
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default()
+        Self::load_from(&config_path())
+    }
+
+    /// Defaults when there is no config yet. A config that doesn't parse (e.g. a typo from
+    /// editing it by hand) is moved aside to `config.json.broken` first, since the defaults
+    /// are saved over it next and would otherwise wipe the allow-list and the API key.
+    fn load_from(path: &Path) -> Self {
+        let Ok(bytes) = std::fs::read(path) else { return Self::default() };
+        match serde_json::from_slice(&bytes) {
+            Ok(c) => c,
+            Err(_) => {
+                let mut broken = path.as_os_str().to_owned();
+                broken.push(".broken");
+                let _ = std::fs::rename(path, PathBuf::from(broken));
+                Self::default()
+            }
+        }
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -113,8 +127,39 @@ pub fn modified(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
+/// Writes a temporary file and renames it over `path`. The temporary name is unique per
+/// process and call: the service and the dashboard write the same files, and a shared name
+/// would let one rename the other's half-written file into place.
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}-{n}.tmp", std::process::id()));
     std::fs::write(&tmp, data)?;
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_broken_config_is_kept_aside_instead_of_overwritten() {
+        let dir = std::env::temp_dir().join(format!("vigil-test-{}-config", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let good = Config { allowlist: vec!["ab".repeat(32)], ..Config::default() };
+        write_atomic(&path, &serde_json::to_vec(&good).unwrap()).unwrap();
+        assert_eq!(Config::load_from(&path).allowlist, good.allowlist);
+        // No temporary files are left behind.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        std::fs::write(&path, br#"{"allowlist": ["abc"], oops}"#).unwrap();
+        let loaded = Config::load_from(&path);
+        assert!(loaded.allowlist.is_empty());
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(dir.join("config.json.broken")).unwrap(), br#"{"allowlist": ["abc"], oops}"#);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

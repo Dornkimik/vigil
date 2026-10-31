@@ -91,7 +91,7 @@ fn cli_update_yara() -> i32 {
     }
 }
 
-/// Exit code: 0 clean, 1 suspicious, 2 malicious.
+/// Exit code: 0 clean, 1 suspicious, 2 malicious, 3 nothing flagged but something could not be scanned.
 fn cli_scan(args: &[String]) -> i32 {
     winapi::attach_parent_console();
     let json = args.iter().any(|a| a == "--json");
@@ -107,7 +107,13 @@ fn cli_scan(args: &[String]) -> i32 {
     let engine = Engine::new(&config::Config::load());
     let mut out = String::new();
     let mut worst = Verdict::Clean;
+    let mut failed = false;
     for p in &paths {
+        if let Err(e) = std::fs::metadata(p) {
+            out += &format!("[ERROR         ] {}: {e}\n", p.display());
+            failed = true;
+            continue;
+        }
         walk_files(p, &mut |file| {
             match engine.scan_file(file, ScanOptions { source: steam::source_for(file, Source::Manual), sniff_all }) {
                 Ok(r) if r.analyzed => {
@@ -123,7 +129,10 @@ fn cli_scan(args: &[String]) -> i32 {
                     }
                 }
                 Ok(_) => {}
-                Err(e) => out += &format!("[ERROR         ] {}: {e}\n", file.display()),
+                Err(e) => {
+                    out += &format!("[ERROR         ] {}: {e}\n", file.display());
+                    failed = true;
+                }
             }
             true
         });
@@ -133,6 +142,8 @@ fn cli_scan(args: &[String]) -> i32 {
         let _ = std::fs::write(f, &out);
     }
     match worst {
+        // A file that couldn't be read wasn't shown to be clean.
+        Verdict::Clean if failed => 3,
         Verdict::Clean => 0,
         Verdict::Suspicious => 1,
         Verdict::Malicious => 2,

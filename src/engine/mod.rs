@@ -554,6 +554,9 @@ fn signature_finding(sig: &Signature, kind: Kind, source: Source) -> Option<Find
         Signature::Invalid(InvalidReason::Untrusted) => {
             Some(Finding::new("sig.untrusted", "Signed with an untrusted or self-signed certificate", 15))
         }
+        Signature::Invalid(InvalidReason::Revoked) => {
+            Some(Finding::new("sig.revoked", "Signed with a revoked certificate (revoked certificates are often stolen ones)", 30))
+        }
         Signature::Invalid(InvalidReason::Other(c)) => {
             Some(Finding::new("sig.invalid", format!("Digital signature does not verify (0x{c:08X})"), 10))
         }

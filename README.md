@@ -89,10 +89,13 @@ shows every finding that added to the score.
    (`svchost.exe`, `lsass.exe`…) outside the Windows folder, shortcut (`.lnk`) droppers,
    ISO/IMG containers, macro-enabled Office files.
 6. **Archives**: password-protected ZIPs that hide programs (a classic way past scanners).
-   Programs and scripts inside ZIPs are unpacked in memory and scanned.
+   Programs and scripts inside ZIPs are unpacked in memory and scanned, up to 500 of them and
+   256 MB of unpacked data per archive, so a small ZIP bomb can't stall scanning. Entries that
+   share their data are unpacked once.
 7. **Authenticode**: a valid signature removes 60% of the heuristic score, unless an
-   encrypted payload is hidden inside the signature block. Broken or untrusted signatures
-   add to it.
+   encrypted payload is hidden inside the signature block. Broken, untrusted or revoked
+   signatures add to it. Revocation is checked against the lists Windows has cached, without
+   going online, so a revoked certificate is only caught once Windows knows about it.
 8. **Known-malware hashes (optional)**: add a free [abuse.ch MalwareBazaar](https://auth.abuse.ch/)
    key in Settings. Vigil downloads MalwareBazaar's full hash export once (refreshed monthly)
    and merges in the 48-hour export twice a day. Every file, signed or not, and every program
@@ -120,6 +123,8 @@ shows every finding that added to the score.
 
 Malicious files are quarantined automatically (configurable). If the file is a program that is
 running, Vigil stops every process running it first, since Windows locks a running program's file.
+When a file can't be moved (it is in use, or its program runs as administrator), Vigil tries again
+every 30 seconds for ten minutes, and a malicious program is checked again every time it starts.
 Suspicious files only trigger a notification. Quarantined files are XOR-encoded in `%LOCALAPPDATA%\Vigil\quarantine` so they
 can't run by accident. Restoring a file also marks it as safe.
 
@@ -151,12 +156,13 @@ This starts the background service and opens the dashboard. In the dashboard, go
 | `vigil.exe` | Start the service if needed and open the dashboard |
 | `vigil.exe --background` | Service and tray icon only (used for autostart) |
 | `vigil.exe --gui` | Dashboard only |
-| `vigil.exe --scan <paths…> [--fast] [--json] [--out file]` | Command-line scan. Exit code 0 = clean, 1 = suspicious, 2 = malicious |
+| `vigil.exe --scan <paths…> [--fast] [--json] [--out file]` | Command-line scan. Exit code 0 = clean, 1 = suspicious, 2 = malicious, 3 = nothing flagged but a path or file could not be scanned |
 | `vigil.exe --update-hashes` | Download the MalwareBazaar hash database now (needs the Auth-Key) |
 | `vigil.exe --update-yara` | Download and compile the YARA Forge rules now |
 
 Tray icon: left-click opens the dashboard. Right-click shows *Scan Downloads now*,
-*Pause protection* and *Exit*.
+*Pause protection* and *Exit*. Files that arrive while protection is paused are scanned once it
+resumes.
 
 ## Custom rules
 

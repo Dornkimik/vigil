@@ -3,10 +3,16 @@
 use super::filetype::{self, Kind};
 use super::{Engine, Finding};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::io::{Cursor, Read};
 
 const MAX_ENTRIES: usize = 5000;
 const MAX_INNER_SIZE: u64 = 64 << 20;
+/// Unpacked bytes analyzed per archive, so a small ZIP that inflates to gigabytes can't
+/// hold up the scan queue (a few seconds of work at most).
+const MAX_TOTAL_INFLATED: u64 = 256 << 20;
+/// Members analyzed per archive; each one costs a full rule and YARA pass.
+const MAX_INSPECTED: usize = 500;
 
 pub fn analyze(engine: &Engine, data: &[u8], depth: u32) -> Vec<Finding> {
     let mut findings = Vec::new();
@@ -18,10 +24,14 @@ pub fn analyze(engine: &Engine, data: &[u8], depth: u32) -> Vec<Finding> {
     let mut risky = None;
     let mut worst: Option<(String, i32, Vec<Finding>)> = None;
     let mut inspected = 0usize;
+    let mut skipped = 0usize;
+    let mut budget = MAX_TOTAL_INFLATED;
+    // Entries that share their data (a classic ZIP bomb) are unpacked once.
+    let mut offsets = HashSet::new();
 
     for i in 0..zip.len().min(MAX_ENTRIES) {
-        let (name, encrypted, size, is_dir) = match zip.by_index_raw(i) {
-            Ok(e) => (e.name().map(|n| n.into_owned()).unwrap_or_default(), e.encrypted(), e.size(), e.is_dir()),
+        let (name, encrypted, size, is_dir, offset) = match zip.by_index_raw(i) {
+            Ok(e) => (e.name().map(|n| n.into_owned()).unwrap_or_default(), e.encrypted(), e.size(), e.is_dir(), e.header_start()),
             Err(_) => continue,
         };
         if is_dir {
@@ -44,12 +54,19 @@ pub fn analyze(engine: &Engine, data: &[u8], depth: u32) -> Vec<Finding> {
             risky = Some(base.clone());
         }
 
-        if encrypted || !code_like || size > MAX_INNER_SIZE || depth > 0 {
+        if encrypted || !code_like || size > MAX_INNER_SIZE || depth > 0 || !offsets.insert(offset) {
+            continue;
+        }
+        // The declared size can lie, so what is actually unpacked is charged too.
+        if size > budget || inspected >= MAX_INSPECTED {
+            skipped += 1;
             continue;
         }
         let mut buf = Vec::with_capacity(size as usize);
         let Ok(entry) = zip.by_index(i) else { continue };
-        if entry.take(MAX_INNER_SIZE).read_to_end(&mut buf).is_err() {
+        let read = entry.take(MAX_INNER_SIZE.min(budget)).read_to_end(&mut buf);
+        budget -= buf.len() as u64;
+        if read.is_err() {
             continue;
         }
         let known = engine.known_hash(&super::hex(&Sha256::digest(&buf)));
@@ -85,6 +102,13 @@ pub fn analyze(engine: &Engine, data: &[u8], depth: u32) -> Vec<Finding> {
     }
     if inspected > 0 {
         findings.push(Finding::new("zip.inspected", format!("Inspected {inspected} program(s) inside the archive"), 0));
+    }
+    if skipped > 0 {
+        findings.push(Finding::new(
+            "zip.partial",
+            format!("{skipped} more program(s) inside were not inspected: the archive is too large to unpack completely"),
+            0,
+        ));
     }
     findings
 }
