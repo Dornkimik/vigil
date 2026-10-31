@@ -8,6 +8,9 @@
 #     require <pattern> | <alternative>  (each require line must have a hit)
 #     scope  any | pe | script | shortcut   (default: any)
 #     case   exact                          (optional: case-sensitive matching)
+#     near   <bytes>     (optional: everything above must be met within one window
+#                         of this many bytes, not just anywhere in a big file)
+#     mask   <pattern>   (optional: hits inside an occurrence of this don't count)
 #     str    <pattern>   (case-insensitive; also matched as UTF-16 and with
 #                         doubled backslashes, so .NET and script sources hit too)
 #   end
@@ -138,12 +141,21 @@ end
 
 # ---------------------------------------------------------------- loaders / droppers
 
+# Editors, terminals and browsers ship lists of PowerShell command names (allow/deny
+# lists, syntax tables, Chrome's paste-and-run checks); a list entry is data, not a download.
 rule loader.download_cradle
   desc   Downloads and executes code (PowerShell / LOLBin download cradle)
   weight 35
   min    2
-  require DownloadString | DownloadData | Invoke-WebRequest | requests.get( | urlopen( | curl http | curl.exe http
-  require Invoke-Expression | IEX( | IEX ( | IEX $ | 'IEX' | "IEX" | | IEX | exec( | eval( | ScriptBlock]::Create
+  require DownloadString | DownloadData | Invoke-WebRequest
+  require Invoke-Expression | IEX( | IEX ( | IEX $ | 'IEX' | "IEX" | | IEX | ScriptBlock]::Create
+  mask   "Invoke-WebRequest",
+  mask   "Invoke-WebRequest"]
+  mask   "Invoke-WebRequest":
+  mask   'Invoke-WebRequest',
+  mask   'Invoke-WebRequest']
+  mask   'Invoke-WebRequest':
+  mask   ,Invoke-WebRequest,
   str    DownloadString(
   str    DownloadFile(
   str    DownloadData(
@@ -163,6 +175,28 @@ rule loader.download_cradle
   str    certutil -decode
   str    mshta http
   str    Start-BitsTransfer
+end
+
+# curl | iex. Bundles and docs for local HTTP APIs are full of "curl http://localhost",
+# so curl only counts right next to the execution.
+rule loader.curl_cradle
+  desc   Downloads code with curl and runs it with PowerShell
+  weight 35
+  near   256
+  require curl http | curl.exe http
+  require Invoke-Expression | IEX( | IEX ( | IEX $ | | IEX | ScriptBlock]::Create
+end
+
+# exec(requests.get(url).text) and friends. These names are everywhere in large
+# JS bundles (RegExp .exec(), a Map called requests) and Python's own test suite,
+# so they only count when they sit together.
+rule loader.script_cradle
+  desc   Downloads code and runs it with exec/eval
+  weight 35
+  scope  script
+  near   256
+  require requests.get( | urlopen(
+  require exec( | eval(
 end
 
 rule loader.script_dropper
@@ -341,6 +375,21 @@ rule impact.hidden_desktop
   require PrintWindow | BitBlt
 end
 
+# Electron apps, CEF and Chrome contain a whole browser, whose sandbox, screen capture
+# and input handling match the API-shape rules above. The engine only treats this as
+# a browser engine in binaries far larger than malware (see engine::BROWSER_ENGINE_SIZE).
+rule info.chromium_engine
+  desc   Contains the Chromium browser engine (Electron, CEF or Chrome)
+  weight 0
+  min    3
+  scope  pe
+  case   exact
+  str    Chrome_WidgetWin_
+  str    v8_context_snapshot
+  str    chrome-extension://
+  str    chrome://gpu
+end
+
 # Capability combinations, rather than individual API/tool names.
 rule loader.memory_payload
   desc   Decodes a payload and loads it as an in-memory assembly
@@ -392,10 +441,23 @@ rule impact.reverse_shell
   desc   Script combines a TCP command channel, command execution and a response stream
   weight 55
   scope  script
-  require Net.Sockets.TCPClient | socket.socket(
-  require GetStream( | .recv(
-  require Invoke-Expression | IEX( | IEX $ | subprocess.Popen( | os.popen(
-  require .Write( | .send( | .sendall(
+  require Net.Sockets.TCPClient
+  require GetStream(
+  require Invoke-Expression | IEX( | IEX $
+  require .Write(
+end
+
+# Sockets and subprocesses meet all over Python test suites and tooling, so the
+# Python form only counts as one compact block.
+rule impact.python_reverse_shell
+  desc   Script connects a TCP socket to a command shell
+  weight 55
+  scope  script
+  near   1024
+  require socket.socket(
+  require .recv(
+  require subprocess.Popen( | os.popen(
+  require .send( | .sendall(
 end
 
 rule impact.miner_evasion

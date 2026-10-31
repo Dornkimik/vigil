@@ -27,6 +27,20 @@ pub const SUSPICIOUS: i32 = 35;
 pub const MALICIOUS: i32 = 70;
 /// Files larger than this only get name/signature/hash checks.
 const MAX_CONTENT_SCAN: u64 = 512 << 20;
+/// Chromium-based programs are well over 100 MB of code; a small program that
+/// merely mentions the engine's marker strings is not a browser engine.
+const BROWSER_ENGINE_SIZE: usize = 64 << 20;
+/// Capabilities every Chromium build has (sandbox desktops, window capture, input
+/// hooks, writing into its own child processes, its password manager and importer
+/// for other browsers' profiles), so they say nothing about the app. Rules for other
+/// people's data (Discord, wallets, exfiltration endpoints) still apply.
+const BROWSER_ENGINE_EXPECTED: &[&str] = &[
+    "rule.impact.hidden_desktop",
+    "rule.stealer.keylogger_hook",
+    "rule.stealer.browser_credentials",
+    "rule.stealer.browser_profiles",
+    "pe.injection",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Verdict {
@@ -208,14 +222,8 @@ impl Engine {
             r.origin = Some(o.url.unwrap_or_else(|| "the internet".into()));
         }
 
-        let mut findings = filetype::name_findings(&r.name, r.kind);
-        if matches!(opts.source, Source::Steam | Source::Workshop) {
-            // Games legitimately ship .js (Electron/web UIs); the extension alone means nothing there.
-            findings.retain(|f| f.id != "name.risky_ext");
-        }
-        if opts.source == Source::Workshop && matches!(r.kind, Kind::Pe | Kind::Script) {
-            findings.push(Finding::new("steam.workshop_code", "Steam Workshop item ships executable code", 10));
-        }
+        let downloaded = r.origin.is_some() || opts.source == Source::Downloads;
+        let mut findings = name_findings(&r.name, r.kind, opts.source, downloaded);
 
         // Content analysis works on a memory map so large game DLLs never sit on the heap.
         let file = File::open(path)?;
@@ -295,6 +303,7 @@ impl Engine {
     /// Content heuristics for an in-memory buffer (a file or an archive member).
     pub(crate) fn analyze_buffer(&self, name: &str, data: &[u8], kind: Kind, depth: u32) -> (i32, Vec<Finding>) {
         let mut findings = Vec::new();
+        let mut browser_engine = false;
         let scope = match kind {
             Kind::Pe | Kind::Installer => Some(Scope::Pe),
             Kind::Script => Some(Scope::Script),
@@ -315,10 +324,22 @@ impl Engine {
                 let title = format!("{}{recovered} [{}{more}]", m.rule.desc, shown.join(", "));
                 findings.push(Finding::new(format!("rule.{}", m.rule.id), title, m.rule.weight));
             }
+            browser_engine = kind == Kind::Pe
+                && data.len() >= BROWSER_ENGINE_SIZE
+                && findings.iter().any(|f| f.id == "rule.info.chromium_engine")
+                && pe::inflated(data).is_none();
+            if browser_engine {
+                findings.retain(|f| !BROWSER_ENGINE_EXPECTED.contains(&f.id.as_str()));
+            } else {
+                findings.retain(|f| f.id != "rule.info.chromium_engine");
+            }
             correlate(&mut findings);
         }
         match kind {
-            Kind::Pe => findings.extend(pe::analyze(data)),
+            Kind::Pe => {
+                let structural = pe::analyze(data).into_iter();
+                findings.extend(structural.filter(|f| !browser_engine || !BROWSER_ENGINE_EXPECTED.contains(&f.id.as_str())))
+            }
             Kind::Script => findings.extend(filetype::script_findings(name, data)),
             Kind::Zip => findings.extend(archive::analyze(self, data, depth)),
             _ => {}
@@ -354,6 +375,20 @@ impl Engine {
     }
 }
 
+/// Filename findings, adjusted for where the file lives.
+fn name_findings(name: &str, kind: Kind, source: Source, downloaded: bool) -> Vec<Finding> {
+    let mut findings = filetype::name_findings(name, kind);
+    // Games and Electron/Node apps ship .js (web UIs, bundles); the extension alone means
+    // nothing there. A .js that arrived from the internet is still the classic WSH dropper.
+    if matches!(source, Source::Steam | Source::Workshop) || (filetype::ext_of(name) == "js" && !downloaded) {
+        findings.retain(|f| f.id != "name.risky_ext");
+    }
+    if source == Source::Workshop && matches!(kind, Kind::Pe | Kind::Script) {
+        findings.push(Finding::new("steam.workshop_code", "Steam Workshop item ships executable code", 10));
+    }
+    findings
+}
+
 fn malwarebazaar_finding(family: &str) -> Finding {
     let family = if family.is_empty() { "unnamed sample" } else { family };
     Finding::new("hash.malwarebazaar", format!("Known malware on MalwareBazaar: {family}"), 100)
@@ -363,6 +398,8 @@ fn malwarebazaar_finding(family: &str) -> Finding {
 /// encoding scheme or family name never earns a behavioral correlation bonus.
 fn correlate(findings: &mut Vec<Finding>) {
     let has = |id: &str| findings.iter().any(|f| f.id == id);
+    // keylogger_hook is left out: overlays, macro tools and browsers install keyboard
+    // hooks, so a hook alone is not collected data.
     let theft = [
         "browser_credentials",
         "discord_tokens",
@@ -370,13 +407,12 @@ fn correlate(findings: &mut Vec<Finding>) {
         "telegram_session",
         "steam_session",
         "keylogger",
-        "keylogger_hook",
         "credential_dump",
     ]
     .iter()
     .any(|id| has(&format!("rule.stealer.{id}")));
     let exfil = has("rule.stealer.exfil_channel");
-    let loader = has("rule.loader.download_cradle") || has("rule.loader.script_dropper") || has("rule.loader.memory_payload");
+    let loader = ["download_cradle", "curl_cradle", "script_cradle", "script_dropper", "memory_payload"].iter().any(|id| has(&format!("rule.loader.{id}")));
     let tamper = ["defender_tamper", "amsi_tamper", "kill_security_tools", "ifeo_hijack"].iter().any(|id| has(&format!("rule.evasion.{id}")));
     let ransom = has("rule.impact.ransomware") && has("rule.impact.ransom_note");
     let hidden_desktop = has("rule.impact.hidden_desktop");

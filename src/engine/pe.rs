@@ -68,7 +68,7 @@ pub fn analyze(data: &[u8]) -> Vec<Finding> {
 }
 
 /// Malware is often padded to hundreds of MB so it exceeds AV upload/scan limits.
-fn inflated(data: &[u8]) -> Option<Finding> {
+pub fn inflated(data: &[u8]) -> Option<Finding> {
     if data.len() < 100 << 20 {
         return None;
     }

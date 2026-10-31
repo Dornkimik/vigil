@@ -29,6 +29,45 @@ pub struct Rule {
     pub patterns: Vec<String>,
     /// Every group must have at least one hit, in addition to `min`.
     pub required: Vec<Vec<usize>>,
+    /// `near <bytes>`: all of the above must be met within one window of this many
+    /// bytes of a single view, so unrelated strings in a large bundle don't combine.
+    pub near: Option<usize>,
+    /// `mask <pattern>`: hits that lie inside a hit of one of these don't count
+    /// (e.g. a command name as an entry in a quoted list of commands).
+    pub masks: Vec<String>,
+}
+
+impl Rule {
+    /// Needs match positions rather than just which patterns occurred.
+    fn positional(&self) -> bool {
+        self.near.is_some() || !self.masks.is_empty()
+    }
+
+    /// Patterns hit inside the first window of `near` bytes that satisfies the rule.
+    /// `hits` are (start, pattern index), sorted by start.
+    fn window(&self, hits: &[(usize, usize)], near: usize) -> Option<Vec<bool>> {
+        let mut count = vec![0usize; self.patterns.len()];
+        let mut distinct = 0;
+        let mut left = 0;
+        for &(start, pi) in hits {
+            if count[pi] == 0 {
+                distinct += 1;
+            }
+            count[pi] += 1;
+            while start - hits[left].0 > near {
+                let p = hits[left].1;
+                count[p] -= 1;
+                if count[p] == 0 {
+                    distinct -= 1;
+                }
+                left += 1;
+            }
+            if distinct >= self.min.max(1) && self.required.iter().all(|g| g.iter().any(|&i| count[i] > 0)) {
+                return Some(count.iter().map(|&c| c > 0).collect());
+            }
+        }
+        None
+    }
 }
 
 pub struct RuleMatch<'a> {
@@ -40,7 +79,8 @@ pub struct RuleMatch<'a> {
 pub struct RuleSet {
     rules: Vec<Rule>,
     /// Case-insensitive and exact-case automatons, each with a map from automaton
-    /// pattern index to (rule index, pattern index within the rule).
+    /// pattern index to (rule index, pattern index within the rule). Indexes past
+    /// the rule's patterns refer to its masks.
     automatons: Vec<(AhoCorasick, Vec<(usize, usize)>)>,
 }
 
@@ -63,7 +103,7 @@ impl RuleSet {
             let mut needles: Vec<Vec<u8>> = Vec::new();
             let mut map = Vec::new();
             for (ri, rule) in rules.iter().enumerate().filter(|(_, r)| r.exact == exact) {
-                for (pi, pat) in rule.patterns.iter().enumerate() {
+                for (pi, pat) in rule.patterns.iter().chain(&rule.masks).enumerate() {
                     for v in variants(pat) {
                         needles.push(v);
                         map.push((ri, pi));
@@ -94,15 +134,42 @@ impl RuleSet {
 
     /// Merge evidence across representations; each rule contributes only once.
     pub fn scan_views(&self, data: &[u8], views: &[Vec<u8>], scope: Scope) -> Vec<RuleMatch<'_>> {
+        let in_scope = |r: &Rule| r.scope == Scope::Any || r.scope == scope;
         let mut seen: Vec<Vec<bool>> = self.rules.iter().map(|r| vec![false; r.patterns.len()]).collect();
         let mut raw = seen.clone();
         for (view_index, view) in std::iter::once(data).chain(views.iter().map(Vec::as_slice)).enumerate() {
+            let mut mark = |ri: usize, pi: usize| {
+                seen[ri][pi] = true;
+                if view_index == 0 {
+                    raw[ri][pi] = true;
+                }
+            };
+            // (start, end, pattern or mask index) for rules that need positions.
+            let mut spans: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); self.rules.len()];
             for (ac, map) in &self.automatons {
                 for m in ac.find_overlapping_iter(view) {
                     let (ri, pi) = map[m.pattern().as_usize()];
-                    seen[ri][pi] = true;
-                    if view_index == 0 {
-                        raw[ri][pi] = true;
+                    let rule = &self.rules[ri];
+                    if !rule.positional() {
+                        mark(ri, pi);
+                    } else if in_scope(rule) {
+                        spans[ri].push((m.start(), m.end(), pi));
+                    }
+                }
+            }
+            for (ri, spans) in spans.into_iter().enumerate().filter(|(_, s)| !s.is_empty()) {
+                let rule = &self.rules[ri];
+                let n = rule.patterns.len();
+                let masks: Vec<_> = spans.iter().filter(|h| h.2 >= n).collect();
+                let masked = |&(start, end, _): &(usize, usize, usize)| masks.iter().any(|&&(s, e, _)| s <= start && end <= e);
+                let mut hits: Vec<(usize, usize)> = spans.iter().filter(|h| h.2 < n && !masked(h)).map(|h| (h.0, h.2)).collect();
+                hits.sort_unstable();
+                match rule.near {
+                    None => hits.iter().for_each(|&(_, pi)| mark(ri, pi)),
+                    Some(near) => {
+                        if let Some(window) = rule.window(&hits, near) {
+                            (0..n).filter(|&pi| window[pi]).for_each(|pi| mark(ri, pi));
+                        }
                     }
                 }
             }
@@ -111,7 +178,7 @@ impl RuleSet {
             .iter()
             .zip(seen)
             .zip(raw)
-            .filter(|((r, _), _)| r.scope == Scope::Any || r.scope == scope)
+            .filter(|((r, _), _)| in_scope(r))
             .filter_map(|((rule, s), raw)| {
                 let matched: Vec<&str> = rule.patterns.iter().zip(&s).filter(|(_, hit)| **hit).map(|(p, _)| p.as_str()).collect();
                 let groups_met = |hits: &[bool]| rule.required.iter().all(|g| g.iter().any(|&i| hits[i]));
@@ -155,6 +222,8 @@ fn parse(text: &str) -> (Vec<Rule>, Vec<String>) {
                     exact: false,
                     patterns: Vec::new(),
                     required: Vec::new(),
+                    near: None,
+                    masks: Vec::new(),
                 })
             }
             ("end", Some(_)) => {
@@ -177,6 +246,8 @@ fn parse(text: &str) -> (Vec<Rule>, Vec<String>) {
                 }
             }
             ("case", Some(r)) => r.exact = rest == "exact",
+            ("near", Some(r)) => r.near = rest.parse().ok(),
+            ("mask", Some(r)) if !rest.is_empty() => r.masks.push(rest.to_string()),
             ("str", Some(r)) if !rest.is_empty() => {
                 add_pattern(r, rest);
             }
@@ -252,6 +323,31 @@ mod tests {
         let wide: Vec<u8> = "Alpha".encode_utf16().flat_map(u16::to_be_bytes).collect();
         assert_eq!(set.scan(&wide, Scope::Pe).len(), 1);
         assert!(set.scan(b"alpha", Scope::Pe).is_empty());
+    }
+
+    #[test]
+    fn near_requires_every_group_inside_one_window_of_one_view() {
+        let (set, errors) = RuleSet::build_for_test("rule t\nnear 16\nrequire fetch\nrequire run\nend");
+        assert!(errors.is_empty());
+        assert_eq!(set.scan(b"fetch then run", Scope::Pe).len(), 1);
+        let far = format!("fetch{}run", " ".repeat(40));
+        assert!(set.scan(far.as_bytes(), Scope::Pe).is_empty());
+        // Halves in different views don't combine.
+        assert!(set.scan_views(b"fetch", &[b"run".to_vec()], Scope::Pe).is_empty());
+        let hits = set.scan_views(far.as_bytes(), &[b"fetch run".to_vec()], Scope::Pe);
+        assert!(hits.len() == 1 && hits[0].decoded);
+        let (set, _) = RuleSet::build_for_test("rule t\nnear 8\nmin 2\nstr alpha\nstr beta\nend");
+        assert_eq!(set.scan(b"alpha beta", Scope::Pe).len(), 1);
+        assert!(set.scan(b"alpha alpha        beta", Scope::Pe).is_empty());
+    }
+
+    #[test]
+    fn masked_hits_do_not_count() {
+        let (set, _) = RuleSet::build_for_test("rule t\nrequire fetch\nrequire run\nmask \"fetch\",\nend");
+        assert!(set.scan(b"[\"fetch\", \"run\"]", Scope::Pe).is_empty());
+        assert_eq!(set.scan(b"[\"fetch\", \"run\"] fetch(url)", Scope::Pe).len(), 1);
+        let wide: Vec<u8> = "[\"fetch\", run]".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert!(set.scan(&wide, Scope::Pe).is_empty());
     }
 
     impl RuleSet {
