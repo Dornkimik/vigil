@@ -240,3 +240,17 @@ fn corrupt_database_files_are_rejected() {
     assert!(hashdb::HashDb::open(&path).is_err());
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn broken_signatures_only_ignored_while_steam_is_still_downloading() {
+    let ids = |sig: Signature, source| signature_finding(&sig, Kind::Pe, source).map(|f| f.id);
+    let tampered = || Signature::Invalid(InvalidReason::Tampered);
+    for source in [Source::Manual, Source::Steam, Source::Workshop, Source::Downloads, Source::Launch] {
+        assert_eq!(ids(tampered(), source).as_deref(), Some("sig.tampered"), "{source:?}");
+    }
+    assert_eq!(ids(tampered(), Source::SteamDownload), None);
+    assert_eq!(ids(Signature::Invalid(InvalidReason::Other(1)), Source::SteamDownload), None);
+    // Certificate trust doesn't depend on the file being complete.
+    let untrusted = Signature::Invalid(InvalidReason::Untrusted);
+    assert_eq!(ids(untrusted, Source::SteamDownload).as_deref(), Some("sig.untrusted"));
+}

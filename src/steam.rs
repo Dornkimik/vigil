@@ -53,7 +53,9 @@ fn parse_library_paths(vdf: &str) -> Vec<PathBuf> {
 /// Steam content gets Steam-specific heuristics even when scanned manually.
 pub fn source_for(path: &Path, default: Source) -> Source {
     let p = path.to_string_lossy().to_ascii_lowercase();
-    if p.contains(r"\steamapps\workshop\") {
+    if p.contains(r"\steamapps\downloading\") || p.contains(r"\steamapps\temp\") {
+        Source::SteamDownload
+    } else if p.contains(r"\steamapps\workshop\") {
         Source::Workshop
     } else if p.contains(r"\steamapps\common\") {
         Source::Steam
@@ -69,5 +71,17 @@ mod tests {
         let vdf = "\"libraryfolders\"\n{\n\t\"0\"\n\t{\n\t\t\"path\"\t\t\"C:\\\\Program Files (x86)\\\\Steam\"\n\t}\n\t\"1\"\n\t{\n\t\t\"path\"\t\t\"D:\\\\SteamLibrary\"\n\t}\n}";
         let p = super::parse_library_paths(vdf);
         assert_eq!(p, vec![std::path::PathBuf::from(r"C:\Program Files (x86)\Steam"), std::path::PathBuf::from(r"D:\SteamLibrary")]);
+    }
+
+    #[test]
+    fn steam_staging_folders_are_downloads() {
+        use crate::engine::Source;
+        let src = |p: &str| super::source_for(std::path::Path::new(p), Source::Manual);
+        let lib = r"C:\Program Files (x86)\Steam\steamapps";
+        assert_eq!(src(&format!(r"{lib}\downloading\381210\Engine\Extras\Redist\en-us\vc_redist.x64.exe")), Source::SteamDownload);
+        assert_eq!(src(&format!(r"{lib}\temp\381210\game.exe")), Source::SteamDownload);
+        assert_eq!(src(&format!(r"{lib}\common\Game\game.exe")), Source::Steam);
+        assert_eq!(src(&format!(r"{lib}\workshop\content\1\2\mod.dll")), Source::Workshop);
+        assert_eq!(src(r"C:\Users\me\Downloads\downloading\setup.exe"), Source::Manual);
     }
 }

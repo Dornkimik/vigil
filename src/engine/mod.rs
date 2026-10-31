@@ -70,6 +70,8 @@ pub enum Source {
     Downloads,
     Steam,
     Workshop,
+    /// Steam's staging folders (`steamapps\downloading`, `steamapps\temp`): files may still be partial.
+    SteamDownload,
     Folder,
     Manual,
     Launch,
@@ -81,10 +83,15 @@ impl Source {
             Source::Downloads => "Downloads",
             Source::Steam => "Steam game",
             Source::Workshop => "Steam Workshop",
+            Source::SteamDownload => "Steam download",
             Source::Folder => "Watched folder",
             Source::Manual => "Manual scan",
             Source::Launch => "Program started",
         }
+    }
+
+    pub fn is_steam(self) -> bool {
+        matches!(self, Source::Steam | Source::Workshop | Source::SteamDownload)
     }
 }
 
@@ -209,7 +216,7 @@ impl Engine {
         }
 
         let mut findings = filetype::name_findings(&r.name, r.kind);
-        if matches!(opts.source, Source::Steam | Source::Workshop) {
+        if opts.source.is_steam() {
             // Games legitimately ship .js (Electron/web UIs); the extension alone means nothing there.
             findings.retain(|f| f.id != "name.risky_ext");
         }
@@ -247,20 +254,7 @@ impl Engine {
         if matches!(r.kind, Kind::Pe | Kind::Installer) {
             match winapi::verify_signature(path) {
                 Signature::Valid(s) => r.signer = Some(s),
-                Signature::Unsigned => {
-                    if r.kind == Kind::Pe {
-                        findings.push(Finding::new("sig.unsigned", "Not digitally signed", 5))
-                    }
-                }
-                Signature::Invalid(InvalidReason::Tampered) => {
-                    findings.push(Finding::new("sig.tampered", "Digital signature is broken: file was modified after signing", 30))
-                }
-                Signature::Invalid(InvalidReason::Untrusted) => {
-                    findings.push(Finding::new("sig.untrusted", "Signed with an untrusted or self-signed certificate", 15))
-                }
-                Signature::Invalid(InvalidReason::Other(c)) => {
-                    findings.push(Finding::new("sig.invalid", format!("Digital signature does not verify (0x{c:08X})"), 10))
-                }
+                sig => findings.extend(signature_finding(&sig, r.kind, opts.source)),
             }
         }
 
@@ -394,6 +388,26 @@ fn correlate(findings: &mut Vec<Finding>) {
     }
     if ransom {
         findings.push(Finding::new("behavior.ransomware", "Backup destruction combined with a ransom demand", 35));
+    }
+}
+
+/// Finding for a signature that is missing or does not verify.
+fn signature_finding(sig: &Signature, kind: Kind, source: Source) -> Option<Finding> {
+    match sig {
+        Signature::Valid(_) => None,
+        Signature::Unsigned => (kind == Kind::Pe).then(|| Finding::new("sig.unsigned", "Not digitally signed", 5)),
+        // Steam is still writing the file, so its hash can't match yet; the finished file
+        // is scanned again once Steam moves it into steamapps\common.
+        Signature::Invalid(InvalidReason::Tampered | InvalidReason::Other(_)) if source == Source::SteamDownload => None,
+        Signature::Invalid(InvalidReason::Tampered) => {
+            Some(Finding::new("sig.tampered", "Digital signature is broken: file was modified after signing", 30))
+        }
+        Signature::Invalid(InvalidReason::Untrusted) => {
+            Some(Finding::new("sig.untrusted", "Signed with an untrusted or self-signed certificate", 15))
+        }
+        Signature::Invalid(InvalidReason::Other(c)) => {
+            Some(Finding::new("sig.invalid", format!("Digital signature does not verify (0x{c:08X})"), 10))
+        }
     }
 }
 

@@ -328,7 +328,7 @@ impl Worker {
             return Ok(());
         }
         let source = steam::source_for(path, source);
-        let opts = ScanOptions { source, sniff_all: !matches!(source, Source::Steam | Source::Workshop) };
+        let opts = ScanOptions { source, sniff_all: !source.is_steam() };
         let engine = self.shared.engine.read().unwrap().clone();
         *self.shared.current.lock().unwrap() = Some(path.display().to_string());
 
@@ -391,7 +391,7 @@ fn handle_report(shared: &Shared, report: Report, source: Source, launched: bool
     }
 
     // Steam installs and everyday program launches produce lots of clean files; only log what matters there.
-    let noisy = matches!(source, Source::Steam | Source::Workshop | Source::Launch);
+    let noisy = source.is_steam() || source == Source::Launch;
     if !noisy || report.verdict != Verdict::Clean {
         store::append_event(&Event { time: store::now(), source, action, report });
     }
