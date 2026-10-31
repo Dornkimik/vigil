@@ -221,7 +221,115 @@ rule evasion.defender_tamper
   weight 25
   min    1
   require Add-MpPreference | Set-MpPreference
-  require -ExclusionPath | -ExclusionProcess | -ExclusionExtension | -DisableRealtimeMonitoring $true | -DisableRealtimeMonitoring 1
+  require -ExclusionPath | -ExclusionProcess | -ExclusionExtension | -DisableRealtimeMonitoring $true | -DisableRealtimeMonitoring 1 | -DisableRealtimeMonitoring:$true | -DisableBehaviorMonitoring $true | -DisableIOAVProtection $true | -DisableScriptScanning $true | -DisableBlockAtFirstSeen $true | -MAPSReporting 0 | -MAPSReporting Disabled | -SubmitSamplesConsent 2 | -SubmitSamplesConsent NeverSend
+end
+
+# The same switches set through Group Policy registry values, which Defender also obeys.
+rule evasion.defender_policy
+  desc   Turns off Microsoft Defender through its policy registry keys
+  weight 25
+  require \Policies\Microsoft\Windows Defender
+  require DisableAntiSpyware | DisableRealtimeMonitoring | DisableBehaviorMonitoring | DisableIOAVProtection | DisableOnAccessProtection | DisableScanOnRealtimeEnable | DisableAntiVirus
+end
+
+rule evasion.defender_exclusion_key
+  desc   Writes Microsoft Defender exclusions directly into the registry
+  weight 25
+  min    1
+  str    \Windows Defender\Exclusions\Paths
+  str    \Windows Defender\Exclusions\Processes
+  str    \Windows Defender\Exclusions\Extensions
+end
+
+rule evasion.defender_service
+  desc   Stops the Defender service or removes its malware definitions
+  weight 25
+  min    1
+  str    sc stop WinDefend
+  str    sc.exe stop WinDefend
+  str    sc config WinDefend
+  str    sc.exe config WinDefend
+  str    sc delete WinDefend
+  str    Stop-Service WinDefend
+  str    -RemoveDefinitions -All
+end
+
+rule evasion.log_clearing
+  desc   Clears Windows event logs or the file-change journal to hide its tracks
+  weight 25
+  min    1
+  str    wevtutil cl
+  str    wevtutil.exe cl
+  str    wevtutil clear-log
+  str    Clear-EventLog
+  str    GlobalSession.ClearLog
+  str    fsutil usn deletejournal
+end
+
+# Opening single ports is normal for games and servers; only switching the firewall off counts.
+rule evasion.firewall_off
+  desc   Turns off Windows Firewall
+  weight 20
+  min    1
+  str    advfirewall set allprofiles state off
+  str    advfirewall set currentprofile state off
+  str    advfirewall set publicprofile state off
+  str    advfirewall set privateprofile state off
+  str    firewall set opmode disable
+  str    firewall set opmode mode=disable
+  str    Set-NetFirewallProfile -All -Enabled False
+  str    Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+end
+
+# Reflection into PowerShell's own logging settings, so script block logging stops recording.
+rule evasion.script_logging_tamper
+  desc   Disables PowerShell script logging from inside the script
+  weight 35
+  scope  script
+  require System.Management.Automation.Utils | PSEtwLogProvider
+  require cachedGroupPolicySettings | etwProvider | m_enabled
+  require NonPublic
+end
+
+# Overwriting the start of EtwEventWrite blinds tools that watch Event Tracing for Windows.
+rule evasion.etw_patch
+  desc   Patches Event Tracing for Windows in memory so security tools stop seeing events
+  weight 35
+  scope  script
+  require EtwEventWrite | NtTraceEvent
+  require VirtualProtect | NtProtectVirtualMemory
+  require Marshal]::Copy | Marshal.Copy | Marshal]::WriteByte | WriteProcessMemory | ctypes.memmove
+end
+
+# PowerShell 2.0 predates AMSI and script logging.
+rule evasion.powershell_downgrade
+  desc   Starts the old PowerShell 2.0 engine, which has no AMSI scanning or script logging
+  weight 20
+  min    1
+  str    powershell -version 2
+  str    powershell.exe -version 2
+  str    powershell -v 2
+  str    powershell.exe -v 2
+end
+
+# Security tools hook ntdll in each process. A fresh copy read from disk replaces those hooks.
+rule evasion.ntdll_unhook
+  desc   Maps a clean copy of ntdll.dll over the loaded one to remove security hooks
+  weight 25
+  require \KnownDlls\ntdll.dll | \System32\ntdll.dll | \SysWOW64\ntdll.dll
+  require .text
+  require VirtualProtect | NtProtectVirtualMemory
+  require MapViewOfFile | NtMapViewOfSection | ReadAllBytes(
+end
+
+# Bring your own vulnerable driver: a legitimately signed driver with a known bug is loaded
+# to get kernel access and kill security software. The tools that ship these drivers are
+# signed, so the signature credit keeps them clean.
+rule evasion.byovd
+  desc   Installs a known-vulnerable kernel driver (used to kill security software)
+  weight 30
+  require sc create | sc.exe create | New-Service | CreateService | NtLoadDriver | ZwLoadDriver
+  require RTCore64.sys | gdrv.sys | dbutil_2_3.sys | mhyprot2.sys | aswArPot.sys | zam64.sys | zamguard64.sys | kprocesshacker.sys | iqvw64e.sys | truesight.sys | procexp152.sys
 end
 
 rule evasion.uac_bypass

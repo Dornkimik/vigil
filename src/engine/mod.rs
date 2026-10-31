@@ -217,9 +217,15 @@ impl Engine {
             findings.push(Finding::new("steam.workshop_code", "Steam Workshop item ships executable code", 10));
         }
 
+        if r.kind == Kind::Pe {
+            let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+            findings.extend(filetype::impostor_finding(path, &root));
+        }
+
         // Content analysis works on a memory map so large game DLLs never sit on the heap.
+        // Oversized programs are mapped too, so padding them past the limit doesn't skip analysis.
         let file = File::open(path)?;
-        let map = if r.size <= MAX_CONTENT_SCAN && r.kind != Kind::DiskImage {
+        let map = if (r.size <= MAX_CONTENT_SCAN || r.kind == Kind::Pe) && r.kind != Kind::DiskImage {
             // SAFETY: read-only mapping; Windows refuses to truncate a mapped file.
             unsafe { memmap2::Mmap::map(&file) }.ok()
         } else {
@@ -240,7 +246,11 @@ impl Engine {
         }
 
         if let Some(m) = &map {
-            findings.extend(self.analyze_buffer(&r.name, m, r.kind, 0).1);
+            let body = if r.size > MAX_CONTENT_SCAN { &m[..pe::image_end(m).min(MAX_CONTENT_SCAN as usize)] } else { &m[..] };
+            findings.extend(self.analyze_buffer(&r.name, body, r.kind, 0).1);
+            if body.len() < m.len() && !findings.iter().any(|f| f.id == "pe.inflated") {
+                findings.extend(pe::inflated(m));
+            }
         }
         drop(map);
 
@@ -278,8 +288,10 @@ impl Engine {
         let mut score: i32 = findings.iter().map(|f| f.weight).sum();
         if let Some(signer) = &r.signer {
             // A valid signature from a real publisher removes most heuristic suspicion
-            // (security and anti-cheat tools legitimately contain many indicators).
-            let credit = if known_bad { 0 } else { score.max(0) * 3 / 5 };
+            // (security and anti-cheat tools legitimately contain many indicators),
+            // unless something is hidden inside the signature itself.
+            let smuggled = findings.iter().any(|f| f.id == "pe.cert_smuggling");
+            let credit = if known_bad || smuggled { 0 } else { score.max(0) * 3 / 5 };
             findings.push(Finding::new("sig.valid", format!("Signed by {signer}"), -credit));
             score -= credit;
         }
@@ -377,7 +389,23 @@ fn correlate(findings: &mut Vec<Finding>) {
     .any(|id| has(&format!("rule.stealer.{id}")));
     let exfil = has("rule.stealer.exfil_channel");
     let loader = has("rule.loader.download_cradle") || has("rule.loader.script_dropper") || has("rule.loader.memory_payload");
-    let tamper = ["defender_tamper", "amsi_tamper", "kill_security_tools", "ifeo_hijack"].iter().any(|id| has(&format!("rule.evasion.{id}")));
+    let tamper = [
+        "defender_tamper",
+        "defender_policy",
+        "defender_exclusion_key",
+        "defender_service",
+        "amsi_tamper",
+        "kill_security_tools",
+        "ifeo_hijack",
+        "log_clearing",
+        "firewall_off",
+        "script_logging_tamper",
+        "etw_patch",
+        "ntdll_unhook",
+        "byovd",
+    ]
+    .iter()
+    .any(|id| has(&format!("rule.evasion.{id}")));
     let ransom = has("rule.impact.ransomware") && has("rule.impact.ransom_note");
     let hidden_desktop = has("rule.impact.hidden_desktop");
     if theft && exfil {
