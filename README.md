@@ -12,6 +12,9 @@ malware gets onto a gaming PC, plus a safety net for programs that arrive any ot
   (a USB stick, an archive extracted to `%TEMP%`, a file another program dropped). Programs
   in the Windows folder are skipped, except in its subfolders that standard users can write
   to (such as `C:\Windows\Temp` and `C:\Windows\Tasks`), where malware hides to look trusted.
+  `rundll32.exe` and `regsvr32.exe` are Windows' own but run any DLL they are given, so the
+  DLL they are told to run, and every DLL from outside the Windows folder they load, is
+  checked too. A malicious one is stopped together with the process hosting it.
 
 ## How it works
 
@@ -179,6 +182,8 @@ and [MITRE ATT&CK obfuscation techniques](https://attack.mitre.org/techniques/T1
   behavior monitoring. Vigil checks the process list once a second without admin rights, so the
   program is already running when it is scanned, and one that starts and exits within a second
   can be missed. Programs running as administrator cannot be stopped; Vigil notifies you instead.
+  DLLs are only checked for `rundll32.exe` and `regsvr32.exe`, and only under those names:
+  DLLs that other programs load (DLL sideloading) and renamed copies of these hosts are not.
 
 - Static heuristics cannot determine intent or observe runtime behavior. Custom encryption,
   runtime-built strings, arbitrary character-code expressions, native packers, and payloads

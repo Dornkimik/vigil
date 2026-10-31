@@ -7,15 +7,18 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::ptr::{null, null_mut};
 
+use windows_sys::Wdk::System::Threading::{NtQueryInformationProcess, ProcessCommandLineInformation};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::Cryptography::{CERT_NAME_SIMPLE_DISPLAY_TYPE, CertGetNameStringW};
 use windows_sys::Win32::Security::WinTrust::*;
 use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+    TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::System::Threading::*;
+use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
 
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -186,21 +189,104 @@ pub fn process_image(pid: u32) -> Option<PathBuf> {
     }
 }
 
-/// Ends every process running `image`, matching by path rather than PID so a reused
-/// PID never hits an unrelated program. Returns false if one of them could not be stopped.
+/// Arguments a process was started with, split the way the C runtime splits them.
+pub fn process_args(pid: u32) -> Option<Vec<String>> {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        // The first call reports the size; u64 storage keeps the UNICODE_STRING header aligned.
+        let mut buf: Vec<u64> = Vec::new();
+        let mut len = 0u32;
+        let mut status = STATUS_INFO_LENGTH_MISMATCH;
+        for _ in 0..2 {
+            status = NtQueryInformationProcess(h, ProcessCommandLineInformation, buf.as_mut_ptr().cast(), (buf.len() * 8) as u32, &mut len);
+            if status != STATUS_INFO_LENGTH_MISMATCH {
+                break;
+            }
+            buf = vec![0; (len as usize).div_ceil(8)];
+        }
+        CloseHandle(h);
+        if status < 0 || buf.is_empty() {
+            return None;
+        }
+        let line = &*(buf.as_ptr() as *const UNICODE_STRING);
+        if line.Buffer.is_null() {
+            return None;
+        }
+        let mut w = std::slice::from_raw_parts(line.Buffer, line.Length as usize / 2).to_vec();
+        w.push(0);
+        let mut n = 0;
+        let argv = CommandLineToArgvW(w.as_ptr(), &mut n);
+        if argv.is_null() {
+            return None;
+        }
+        let args = (0..n.max(0) as usize)
+            .map(|i| {
+                let arg = *argv.add(i);
+                let len = (0..).take_while(|&j| *arg.add(j) != 0).count();
+                String::from_utf16_lossy(std::slice::from_raw_parts(arg, len))
+            })
+            .collect();
+        LocalFree(argv.cast());
+        Some(args)
+    }
+}
+
+/// Files of the modules (the program and its DLLs) loaded into a process. Empty for
+/// processes we may not inspect (elevated, protected) or that already exited.
+pub fn process_modules(pid: u32) -> Vec<PathBuf> {
+    let mut modules = Vec::new();
+    unsafe {
+        // Fails with ERROR_BAD_LENGTH while the process is still loading modules.
+        let mut snap = INVALID_HANDLE_VALUE;
+        for _ in 0..3 {
+            snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+            if snap != INVALID_HANDLE_VALUE || GetLastError() != ERROR_BAD_LENGTH {
+                break;
+            }
+        }
+        if snap == INVALID_HANDLE_VALUE {
+            return modules;
+        }
+        let mut entry: MODULEENTRY32W = std::mem::zeroed();
+        entry.dwSize = size_of::<MODULEENTRY32W>() as u32;
+        let mut ok = Module32FirstW(snap, &mut entry);
+        while ok != 0 {
+            modules.push(PathBuf::from(from_wide(&entry.szExePath)));
+            ok = Module32NextW(snap, &mut entry);
+        }
+        CloseHandle(snap);
+    }
+    modules
+}
+
+/// Ends every process running `file`, or, when none runs it, every process that has it
+/// loaded as a DLL. Matches by path rather than PID so a reused PID never hits an
+/// unrelated program. Returns false if one of them could not be stopped.
 /// Processes we cannot open (elevated ones) are skipped; quarantine then fails visibly.
-pub fn terminate_image(image: &Path) -> bool {
+pub fn stop_processes_using(file: &Path) -> bool {
+    let same = |p: &Path| p.as_os_str().eq_ignore_ascii_case(file.as_os_str());
     let mut all = true;
-    for pid in process_ids() {
-        unsafe {
-            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
-            if h.is_null() {
-                continue;
+    let mut found = false;
+    for as_module in [false, true] {
+        for pid in process_ids() {
+            unsafe {
+                let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
+                if h.is_null() {
+                    continue;
+                }
+                let uses = if as_module { process_modules(pid).iter().any(|m| same(m)) } else { image_of(h).is_some_and(|p| same(&p)) };
+                if uses {
+                    found = true;
+                    all &= TerminateProcess(h, 1) != 0 && WaitForSingleObject(h, 5000) == WAIT_OBJECT_0;
+                }
+                CloseHandle(h);
             }
-            if image_of(h).is_some_and(|p| p.as_os_str().eq_ignore_ascii_case(image.as_os_str())) {
-                all &= TerminateProcess(h, 1) != 0 && WaitForSingleObject(h, 5000) == WAIT_OBJECT_0;
-            }
-            CloseHandle(h);
+        }
+        if found {
+            break;
         }
     }
     all

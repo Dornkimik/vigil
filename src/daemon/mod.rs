@@ -39,7 +39,8 @@ pub enum Work {
     Changed(PathBuf, Source),
     /// An explicit request to (re)scan a file or folder, ignoring the scan cache.
     Scan(PathBuf, Source),
-    /// The image of a program that just started. Scanned right away, ahead of other work.
+    /// The image of a program that just started, or a DLL that rundll32/regsvr32 runs.
+    /// Scanned right away, ahead of other work.
     Launched(PathBuf),
 }
 
@@ -204,7 +205,7 @@ struct Pending {
     due: Instant,
     attempts: u32,
     force: bool,
-    /// The file is the image of a running program, which gets stopped if it is malicious.
+    /// The file is the image or a DLL of a running program, which gets stopped if it is malicious.
     launched: bool,
 }
 
@@ -350,7 +351,7 @@ fn handle_report(shared: &Shared, report: Report, source: Source, launched: bool
     }
     if report.verdict == Verdict::Malicious && cfg.auto_quarantine {
         // A running program locks its file, so it has to be stopped before it can be moved.
-        let stopped = launched && winapi::terminate_image(&report.path);
+        let stopped = launched && winapi::stop_processes_using(&report.path);
         let mut result = store::quarantine(&report);
         // The image can stay mapped for a moment after the process exits.
         for _ in 0..5 {
