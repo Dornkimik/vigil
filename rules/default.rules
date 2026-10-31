@@ -255,18 +255,33 @@ rule evasion.anti_analysis
   str    qemu-ga
 end
 
+# GetProcessesByName covers .NET AV killers, which call Process.Kill() instead of
+# taskkill. .NET passes process names without ".exe", so names here omit it.
 rule evasion.kill_security_tools
   desc   Terminates security software processes
   weight 25
   min    2
-  require taskkill /f /im | taskkill.exe /f /im | Stop-Process
-  require MsMpEng.exe | avp.exe | MBAMService | bdagent.exe | ekrn.exe
-  str    MsMpEng.exe
+  require taskkill /f /im | taskkill.exe /f /im | Stop-Process | GetProcessesByName
+  require MsMpEng | avp.exe | MBAMService | bdagent | ekrn.exe | MsSense | SentinelAgent | CSFalconService
+  str    MsMpEng
   str    taskkill /f /im
   str    avp.exe
   str    MBAMService
-  str    bdagent.exe
+  str    bdagent
   str    ekrn.exe
+  str    MsSense
+  str    SentinelAgent
+  str    CSFalconService
+end
+
+# A Debugger value under IFEO runs another program instead of the named one.
+# Process Explorer does this for taskmgr.exe, so only security tools count here.
+rule evasion.ifeo_hijack
+  desc   Uses Image File Execution Options to stop security software from starting
+  weight 35
+  require Image File Execution Options
+  require Debugger
+  require MsMpEng.exe | MpCmdRun.exe | MsSense.exe | SecurityHealthSystray.exe | SentinelAgent.exe | CSFalconService.exe | ekrn.exe | egui.exe | avp.exe | avpui.exe | bdagent.exe | MBAMService.exe | mbam.exe
 end
 
 # ---------------------------------------------------------------- impact
@@ -313,6 +328,17 @@ rule impact.remote_access
   str    DcRat
   str    Remcos
   str    XWorm
+  str    CrySome
+end
+
+# Hidden VNC: a second desktop the user can't see, with programs started on it and
+# captured. Desktop switchers create desktops too, but don't capture windows on them.
+rule impact.hidden_desktop
+  desc   Runs programs on a hidden desktop and captures its windows (hidden VNC)
+  weight 20
+  require CreateDesktop
+  require SetThreadDesktop | lpDesktop
+  require PrintWindow | BitBlt
 end
 
 # Capability combinations, rather than individual API/tool names.
@@ -348,6 +374,18 @@ rule stealer.keylogger
   require GetAsyncKeyState | SetWindowsHookEx | pynput.keyboard.Listener
   require GetForegroundWindow | GetWindowText
   require WriteAllText | AppendAllText | WriteFile | sendmail( | UploadString(
+end
+
+# Overlays, macro tools and Chromium-embedding launchers install keyboard hooks too,
+# so this mostly serves as corroboration.
+rule stealer.keylogger_hook
+  desc   Installs a keyboard hook and records the foreground window
+  weight 5
+  scope  pe
+  require SetWindowsHookEx
+  require CallNextHookEx
+  require GetForegroundWindow
+  require GetWindowText
 end
 
 rule impact.reverse_shell
@@ -391,6 +429,15 @@ rule persistence.hidden_copy
   str    \AppData\Roaming\Microsoft\Windows\svchost.exe
   str    \AppData\Local\Temp\svchost.exe
   str    Copy-Item $PSCommandPath
+end
+
+# Push-button reset runs scripts listed in C:\Recovery\OEM\ResetConfig.xml, so a
+# program registered there comes back after "Reset this PC".
+rule persistence.recovery_partition
+  desc   Registers itself to run again after Windows is reset
+  weight 25
+  require \Recovery\OEM | ResetConfig.xml
+  require BasicReset_AfterImageApply | FactoryReset_AfterImageApply | FactoryReset_AfterDiskFormat
 end
 
 # ---------------------------------------------------------------- shortcuts

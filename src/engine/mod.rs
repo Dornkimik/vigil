@@ -363,19 +363,34 @@ fn malwarebazaar_finding(family: &str) -> Finding {
 /// encoding scheme or family name never earns a behavioral correlation bonus.
 fn correlate(findings: &mut Vec<Finding>) {
     let has = |id: &str| findings.iter().any(|f| f.id == id);
-    let theft =
-        ["browser_credentials", "discord_tokens", "crypto_wallets", "telegram_session", "steam_session", "keylogger", "credential_dump"]
-            .iter()
-            .any(|id| has(&format!("rule.stealer.{id}")));
+    let theft = [
+        "browser_credentials",
+        "discord_tokens",
+        "crypto_wallets",
+        "telegram_session",
+        "steam_session",
+        "keylogger",
+        "keylogger_hook",
+        "credential_dump",
+    ]
+    .iter()
+    .any(|id| has(&format!("rule.stealer.{id}")));
     let exfil = has("rule.stealer.exfil_channel");
     let loader = has("rule.loader.download_cradle") || has("rule.loader.script_dropper") || has("rule.loader.memory_payload");
-    let tamper = has("rule.evasion.defender_tamper") || has("rule.evasion.amsi_tamper");
+    let tamper = ["defender_tamper", "amsi_tamper", "kill_security_tools", "ifeo_hijack"].iter().any(|id| has(&format!("rule.evasion.{id}")));
     let ransom = has("rule.impact.ransomware") && has("rule.impact.ransom_note");
+    let hidden_desktop = has("rule.impact.hidden_desktop");
     if theft && exfil {
         findings.push(Finding::new("behavior.theft_exfil", "Credential/session collection combined with an exfiltration endpoint", 30));
     }
     if loader && tamper {
         findings.push(Finding::new("behavior.loader_evasion", "Payload execution combined with security tampering", 25));
+    }
+    if theft && tamper {
+        findings.push(Finding::new("behavior.theft_evasion", "Credential/session collection combined with security tampering", 25));
+    }
+    if theft && hidden_desktop {
+        findings.push(Finding::new("behavior.hidden_remote_control", "Credential/session collection combined with hidden-desktop remote control", 20));
     }
     if ransom {
         findings.push(Finding::new("behavior.ransomware", "Backup destruction combined with a ransom demand", 35));

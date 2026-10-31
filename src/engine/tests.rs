@@ -78,6 +78,34 @@ fn common_malware_capability_combinations_are_detected() {
 }
 
 #[test]
+fn remote_access_trojan_capabilities_in_programs() {
+    let engine = engine();
+    let creds = "\\Login Data \\Local State encrypted_key CryptUnprotectData \\Google\\Chrome\\User Data \\Microsoft\\Edge\\User Data \\BraveSoftware\\Brave-Browser";
+    let benign = [
+        ("procexp.exe", "Image File Execution Options Debugger taskmgr.exe".to_string()),
+        ("desktops.exe", "CreateDesktop SetThreadDesktop lpDesktop SwitchDesktop".to_string()),
+        ("macros.exe", "SetWindowsHookEx CallNextHookEx GetForegroundWindow GetWindowText \\CurrentVersion\\Run".to_string()),
+        ("avstatus.exe", "GetProcessesByName MsMpEng MsSense SentinelAgent".to_string()),
+        ("browser.exe", format!("{creds} SetWindowsHookEx CallNextHookEx GetForegroundWindow GetWindowText")),
+    ];
+    for (name, text) in benign {
+        let (score, findings) = score(&engine, name, &text, Kind::Pe);
+        assert!(score < SUSPICIOUS, "{name}: {score} {findings:?}");
+    }
+    let malicious = [
+        ("killer.exe", format!("{creds} GetProcessesByName MsMpEng MsSense \\CurrentVersion\\Run"), MALICIOUS),
+        ("ifeo.exe", format!("{creds} SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options Debugger MsMpEng.exe"), MALICIOUS),
+        ("hvnc.exe", format!("{creds} CreateDesktop lpDesktop PrintWindow SetWindowsHookEx CallNextHookEx GetForegroundWindow GetWindowText"), MALICIOUS),
+        ("ifeo_only.exe", "Image File Execution Options Debugger MsMpEng.exe".to_string(), SUSPICIOUS),
+        ("reset.exe", "C:\\Recovery\\OEM\\ResetConfig.xml BasicReset_AfterImageApply \\CurrentVersion\\Run".to_string(), SUSPICIOUS),
+    ];
+    for (name, text, threshold) in malicious {
+        let (score, findings) = score(&engine, name, &text, Kind::Pe);
+        assert!(score >= threshold, "{name}: {score} {findings:?}");
+    }
+}
+
+#[test]
 fn encoded_and_split_payloads_retain_verdict_without_duplicate_points() {
     let engine = engine();
     let payload = "Invoke-Expression DownloadString( Add-MpPreference -ExclusionPath";

@@ -35,14 +35,18 @@ shows every finding that added to the score.
    - Loaders: PowerShell and LOLBin download cradles, Windows Script Host droppers,
      paste-site payloads, AutoIt.
    - Evasion: tampering with Defender or adding exclusions, UAC bypasses, sandbox and VM
-     checks, killing security tools.
+     checks, killing security tools (including .NET `GetProcessesByName` killers), and
+     Image File Execution Options hijacks that stop security tools from starting.
    - Impact: backup deletion paired with ransom demands, reverse-shell capability
-     combinations, and miners paired with security tampering.
+     combinations, miners paired with security tampering, and hidden-desktop (HVNC)
+     remote control.
+   - Persistence: Run keys, scheduled tasks, hidden copies, and push-button reset hooks
+     (`C:\Recovery\OEM\ResetConfig.xml`) that survive "Reset this PC".
    - Credential dumping, keylogging with window context, and in-memory .NET loaders.
    Required evidence groups distinguish capabilities: downloading alone is different
    from downloading **and** executing. Independent combinations (credential collection
-   plus an exfiltration endpoint, or payload execution plus security tampering) add
-   corroboration points. Family names, AutoIt/PyInstaller packaging, and encoding alone
+   plus an exfiltration endpoint, security tampering or hidden-desktop control, or payload
+   execution plus security tampering) add corroboration points. Family names, AutoIt/PyInstaller packaging, and encoding alone
    do not trigger alerts; ordinary mining configuration stays below the alert threshold.
    These are static indicators of possible behavior, not proof that a command ran.
 2. **Static script recovery**: scripts (including `.py`/`.pyw`) and shortcut command text
