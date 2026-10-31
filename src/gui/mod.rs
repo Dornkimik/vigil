@@ -774,7 +774,7 @@ impl App {
             };
             changed |= toggle_row(ui, "Watch Steam libraries", &steam_desc, &mut c.watch_steam);
             ui.separator();
-            changed |= toggle_row(ui, "Scan programs when they start", "Check every program you run, wherever it is stored.", &mut c.watch_launches);
+            changed |= toggle_row(ui, "Scan programs when they start", "Check every program and script you run, and scripts as soon as they are saved in your folders.", &mut c.watch_launches);
             ui.separator();
             changed |= toggle_row(
                 ui,

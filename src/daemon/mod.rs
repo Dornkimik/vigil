@@ -5,7 +5,7 @@ mod procwatch;
 pub mod tray;
 
 use crate::config::{self, Config};
-use crate::engine::filetype::{TEMP_EXTS, ext_of};
+use crate::engine::filetype::{TEMP_EXTS, USER_SCRIPT_EXTS, ext_of};
 use crate::engine::{Engine, Report, ScanOptions, Source, Verdict, hashdb, memory, yara};
 use crate::store::{self, Action, Event, Status, WatchedDir};
 use crate::{steam, winapi};
@@ -40,6 +40,7 @@ pub struct Shared {
     pub queued: AtomicUsize,
     pub current: Mutex<Option<String>>,
     pub watched: Mutex<Vec<WatchedDir>>,
+    pub(crate) burst: procwatch::Burst,
 }
 
 pub enum Work {
@@ -53,8 +54,6 @@ pub enum Work {
     /// A program that just started, by process ID. Its memory is checked once it has had
     /// time to unpack itself.
     Started(u32, PathBuf),
-    /// A script host that just started (process ID, program, command line). Scanned right away.
-    Command(u32, PathBuf, String),
 }
 
 pub fn run(open_gui: bool) {
@@ -73,6 +72,7 @@ pub fn run(open_gui: bool) {
         queued: AtomicUsize::new(0),
         current: Mutex::new(None),
         watched: Mutex::new(Vec::new()),
+        burst: procwatch::Burst::new(),
     });
 
     let (tx, rx) = mpsc::channel();
@@ -126,17 +126,47 @@ pub fn desired_watches(cfg: &Config) -> Vec<WatchedDir> {
         v.extend(s.workshop.into_iter().map(|path| WatchedDir { path, source: Source::Workshop }));
     }
     v.extend(cfg.extra_folders.iter().filter(|p| p.is_dir()).map(|p| WatchedDir { path: p.clone(), source: Source::Folder }));
+    if cfg.watch_launches {
+        // Droppers write their next stage wherever the user can: Documents, Desktop, AppData,
+        // Temp, Startup. Documents and Desktop can be redirected out of the profile.
+        let roots: Vec<PathBuf> = [dirs::home_dir(), dirs::document_dir(), dirs::desktop_dir()].into_iter().flatten().collect();
+        for (i, root) in roots.iter().enumerate() {
+            let nested = roots.iter().enumerate().any(|(j, other)| j != i && root.starts_with(other) && (root != other || j < i));
+            if !nested {
+                v.push(WatchedDir { path: root.clone(), source: Source::UserFolder });
+            }
+        }
+    }
     v
 }
 
-fn start_watchers(dirs: &[WatchedDir], tx: &Sender<Work>) -> Vec<RecommendedWatcher> {
+/// A script type that runs on a double-click or at login, outside the folders watched for
+/// everything. Windows keeps a shortcut in Recent for every file opened; those are skipped.
+fn is_user_script(path: &Path, watched_elsewhere: &[PathBuf]) -> bool {
+    let name = path.to_string_lossy();
+    USER_SCRIPT_EXTS.contains(&ext_of(&name).as_str())
+        && !name.to_ascii_lowercase().contains(r"\microsoft\windows\recent\")
+        && !watched_elsewhere.iter().any(|d| path.starts_with(d))
+}
+
+fn start_watchers(shared: &Arc<Shared>, dirs: &[WatchedDir], tx: &Sender<Work>) -> Vec<RecommendedWatcher> {
     let mut watchers = Vec::new();
+    let elsewhere: Vec<PathBuf> = dirs.iter().filter(|d| d.source != Source::UserFolder).map(|d| d.path.clone()).collect();
     for d in dirs {
         let (tx, source) = (tx.clone(), d.source);
+        // A whole profile changes constantly; only new scripts are worth a look there.
+        let only_scripts = (source == Source::UserFolder).then(|| elsewhere.clone());
+        let shared = shared.clone();
         let handler = move |res: notify::Result<notify::Event>| {
             let Ok(ev) = res else { return };
             if matches!(ev.kind, notify::EventKind::Create(_) | notify::EventKind::Modify(_)) {
                 for p in ev.paths {
+                    match &only_scripts {
+                        Some(skip) if !is_user_script(&p, skip) => continue,
+                        // It is probably about to run: be watching closely when it does.
+                        Some(_) => shared.burst.start(),
+                        None => {}
+                    }
                     let _ = tx.send(Work::Changed(p, source));
                 }
             }
@@ -164,7 +194,7 @@ fn supervisor(shared: Arc<Shared>, tx: Sender<Work>) {
     };
     let mut last_stamp = stamp();
     let mut dirs = desired_watches(&shared.config.read().unwrap());
-    let mut watchers = start_watchers(&dirs, &tx);
+    let mut watchers = start_watchers(&shared, &dirs, &tx);
     *shared.watched.lock().unwrap() = dirs.clone();
     let mut last_discovery = Instant::now();
 
@@ -182,7 +212,7 @@ fn supervisor(shared: Arc<Shared>, tx: Sender<Work>) {
             if changed {
                 watchers.clear();
                 dirs = wanted;
-                watchers = start_watchers(&dirs, &tx);
+                watchers = start_watchers(&shared, &dirs, &tx);
                 *shared.watched.lock().unwrap() = dirs.clone();
             }
             tray::refresh();
@@ -323,10 +353,6 @@ impl Worker {
                 self.memory.push(MemoryScan { pid, path, started: Instant::now(), pass: 0 });
                 return;
             }
-            Work::Command(pid, image, line) => {
-                self.scan_command(pid, &image, &line);
-                return;
-            }
             Work::Changed(p, s) => (p, s, false, false),
             Work::Scan(p, s) => (p, s, true, false),
             Work::Launched(p) => (p, Source::Launch, false, true),
@@ -337,7 +363,10 @@ impl Worker {
             return;
         }
         // A finished download or a running program won't change any more; no need to let it settle.
-        let due = Instant::now() + if force || launched { Duration::ZERO } else { SETTLE };
+        // A script in a user folder may be run the moment it is written, so it can't wait either:
+        // if it was still being written, the next change scans it again.
+        let urgent = force || launched || source == Source::UserFolder;
+        let due = Instant::now() + if urgent { Duration::ZERO } else { SETTLE };
         let entry = self.pending.entry(path).or_insert(Pending { source, due, attempts: 0, force, launched, unresolved: None });
         entry.due = due;
         entry.force |= force;
@@ -358,25 +387,14 @@ impl Worker {
             return;
         }
         let now = Instant::now();
-        let due: Vec<PathBuf> = self.pending.iter().filter(|(_, p)| p.launched && p.due <= now).map(|(k, _)| k.clone()).collect();
+        let due: Vec<PathBuf> =
+            self.pending.iter().filter(|(_, p)| (p.launched || p.source == Source::UserFolder) && p.due <= now).map(|(k, _)| k.clone()).collect();
         for path in due {
             if let Some(p) = self.pending.remove(&path) {
                 self.process(&path, p);
             }
         }
         self.scan_memory();
-    }
-
-    /// Checks the command line a script host started with. It is short and the host may
-    /// finish within moments, so it goes ahead of everything else.
-    fn scan_command(&mut self, pid: u32, image: &Path, line: &str) {
-        if self.shared.config.read().unwrap().paused {
-            return;
-        }
-        let engine = self.shared.engine.read().unwrap().clone();
-        let report = engine.scan_command(image, line);
-        self.shared.scanned.fetch_add(1, Ordering::Relaxed);
-        handle_command(&self.shared, &report, pid);
     }
 
     /// Checks the memory of programs that started a while ago.
@@ -562,9 +580,13 @@ fn handle_report(shared: &Shared, report: &Report, source: Source, launched: boo
     action
 }
 
-/// A script host started with a malicious command is stopped. There is no file to
-/// quarantine: the program is Windows' own and the code lives only in its command line.
-fn handle_command(shared: &Shared, report: &Report, pid: u32) {
+/// Scans the command line a script host started with. A malicious one gets the host and
+/// everything it started stopped. There is no file to quarantine: the program is Windows'
+/// own and the code lives only in its command line.
+fn check_command(shared: &Shared, pid: u32, image: &Path, line: &str) {
+    let engine = shared.engine.read().unwrap().clone();
+    let report = &engine.scan_command(image, line);
+    shared.scanned.fetch_add(1, Ordering::Relaxed);
     let cfg = shared.config.read().unwrap().clone();
     if report.verdict >= Verdict::Suspicious {
         shared.threats.fetch_add(1, Ordering::Relaxed);
@@ -617,7 +639,7 @@ fn announce(cfg: &Config, report: &Report, source: Source, launched: bool, actio
     }
 
     // Steam installs and everyday program launches produce lots of clean files; only log what matters there.
-    let noisy = source.is_steam() || source == Source::Launch;
+    let noisy = source.is_steam() || source == Source::Launch || source == Source::UserFolder;
     if !noisy || report.verdict != Verdict::Clean {
         store::append_event(&Event { time: store::now(), source, action, report: report.clone() });
     }
@@ -636,6 +658,7 @@ mod tests {
             queued: AtomicUsize::new(0),
             current: Mutex::new(None),
             watched: Mutex::new(Vec::new()),
+            burst: procwatch::Burst::new(),
         });
         // The sender is dropped: these tests feed the worker directly.
         let (_, rx) = mpsc::channel();
@@ -745,5 +768,34 @@ mod tests {
         w.scan_one(&path, Source::Launch, false, true).unwrap();
         assert_eq!(w.shared.scanned.load(Ordering::Relaxed), before + 1);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_new_scripts_count_in_user_folders() {
+        let skip = [PathBuf::from(r"C:\Users\me\Downloads")];
+        for yes in [r"C:\Users\me\Documents\s.bat", r"C:\Users\me\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\a.HTA", r"C:\Users\me\AppData\Local\Temp\x.ps1"] {
+            assert!(is_user_script(Path::new(yes), &skip), "{yes}");
+        }
+        for no in [
+            r"C:\Users\me\projects\app\node_modules\x\index.js",
+            r"C:\Users\me\AppData\Local\Google\Chrome\User Data\Default\Cache\f_0001",
+            r"C:\Users\me\AppData\Roaming\Microsoft\Windows\Recent\notes.txt.lnk",
+            // Downloads has its own watcher, which scans everything there.
+            r"C:\Users\me\Downloads\setup.bat",
+        ] {
+            assert!(!is_user_script(Path::new(no), &skip), "{no}");
+        }
+    }
+
+    #[test]
+    fn user_folders_are_watched_along_with_program_starts() {
+        let base = Config { watch_downloads: false, watch_steam: false, extra_folders: Vec::new(), ..Config::default() };
+        let on = desired_watches(&Config { watch_launches: true, ..base.clone() });
+        let user: Vec<&PathBuf> = on.iter().filter(|w| w.source == Source::UserFolder).map(|w| &w.path).collect();
+        assert!(user.contains(&&dirs::home_dir().unwrap()));
+        // A folder inside another one is not watched twice.
+        assert!(user.iter().all(|a| user.iter().all(|b| a == b || !a.starts_with(b))), "{user:?}");
+        let off = desired_watches(&Config { watch_launches: false, ..base });
+        assert!(!off.iter().any(|w| w.source == Source::UserFolder));
     }
 }

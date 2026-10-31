@@ -1,14 +1,18 @@
 //! Scans programs as they start. Polls the process list once a second (no admin rights
 //! needed) and queues the image of every process that wasn't there on the last pass.
-//! A program that starts and exits between two polls is missed.
+//! A program that starts and exits between two polls is missed. For a few seconds after
+//! a script host starts, or a script is saved in a user folder (droppers write their
+//! script and run it right away), it polls every 50 ms instead: what the script starts
+//! (a hidden PowerShell, a downloaded payload) is seen before it gets far.
 //!
 //! `rundll32.exe` and `regsvr32.exe` are Windows' own, but run whatever DLL they are
 //! given, so for them the DLLs come next: the one named on the command line, and every
 //! DLL from outside the Windows folder they load while they run.
 //!
-//! PowerShell, cmd, mshta and Windows Script Host run code given on their command line,
-//! which never touches the disk, so their command lines are scanned too, along with the
-//! script file they are told to run.
+//! PowerShell, cmd, mshta, Windows Script Host and conhost run code given on their
+//! command line, which never touches the disk, so their command lines are scanned too,
+//! right here rather than behind the worker's queue, along with the script file they are
+//! told to run.
 //!
 //! Each program is also reported with its process ID, so its memory can be checked
 //! once it has had time to unpack itself.
@@ -18,14 +22,47 @@ use crate::engine::{cmdline, filetype};
 use crate::winapi;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const POLL: Duration = Duration::from_secs(1);
+/// PowerShell runs the first line of its command about 110 ms after it starts.
+const FAST_POLL: Duration = Duration::from_millis(50);
+/// How long polling stays fast after a script host starts or a script is saved.
+const BURST: Duration = Duration::from_secs(5);
 /// Windows programs that run code from a DLL named on their command line.
 const DLL_HOSTS: &[&str] = &["rundll32.exe", "regsvr32.exe"];
+
+/// Asks the process watcher to poll fast for a while, and wakes it up to start now.
+pub(crate) struct Burst {
+    until: Mutex<Instant>,
+    wake: Condvar,
+}
+
+impl Burst {
+    pub fn new() -> Self {
+        Self { until: Mutex::new(Instant::now()), wake: Condvar::new() }
+    }
+
+    pub fn start(&self) {
+        *self.until.lock().unwrap() = Instant::now() + BURST;
+        self.wake.notify_all();
+    }
+
+    /// Waits until the next poll is due.
+    fn sleep(&self) {
+        let until = self.until.lock().unwrap();
+        if Instant::now() < *until {
+            drop(until);
+            thread::sleep(FAST_POLL);
+            return;
+        }
+        let idle = *until;
+        let _ = self.wake.wait_timeout_while(until, POLL, |u| *u == idle);
+    }
+}
 
 pub fn run(shared: Arc<Shared>, tx: Sender<Work>) {
     winapi::set_background_priority();
@@ -35,6 +72,7 @@ pub fn run(shared: Arc<Shared>, tx: Sender<Work>) {
     let mut known = HashSet::new();
     // Running DLL hosts and the modules already queued for each.
     let mut hosts: HashMap<u32, HashSet<PathBuf>> = HashMap::new();
+    let mut modules_checked = Instant::now();
     loop {
         let enabled = {
             let cfg = shared.config.read().unwrap();
@@ -55,9 +93,10 @@ pub fn run(shared: Arc<Shared>, tx: Sender<Work>) {
                 if cmdline::is_script_host(&image)
                     && let Some(line) = winapi::process_command_line(pid)
                 {
+                    shared.burst.start();
                     let script = cmdline::script_file(&image, &winapi::split_args(&line)).map(long_path);
                     queue.extend(script.filter(|s| !is_system(s, &system_root)).map(Work::Launched));
-                    queue.push(Work::Command(pid, image.clone(), line));
+                    super::check_command(&shared, pid, &image, &line);
                 }
                 if is_system(&image, &system_root) || own_exe.as_ref().is_some_and(|e| e.as_os_str().eq_ignore_ascii_case(image.as_os_str())) {
                     continue;
@@ -65,9 +104,14 @@ pub fn run(shared: Arc<Shared>, tx: Sender<Work>) {
                 queue.push(Work::Launched(image.clone()));
                 queue.push(Work::Started(pid, image));
             }
-            // DLLs load after the host starts, so hosts are re-checked on every pass while they run.
+            // DLLs load after the host starts, so hosts are re-checked while they run, at the
+            // normal pace: listing a process's modules costs far more than listing processes.
             hosts.retain(|pid, _| current.contains(pid));
-            for (&pid, queued) in &mut hosts {
+            let modules_due = modules_checked.elapsed() >= POLL;
+            if modules_due {
+                modules_checked = Instant::now();
+            }
+            for (&pid, queued) in hosts.iter_mut().filter(|_| modules_due) {
                 for module in winapi::process_modules(pid).into_iter().map(long_path) {
                     if !is_system(&module, &system_root) && queued.insert(module.clone()) {
                         queue.push(Work::Launched(module));
@@ -85,7 +129,7 @@ pub fn run(shared: Arc<Shared>, tx: Sender<Work>) {
             known.clear();
             hosts.clear();
         }
-        thread::sleep(POLL);
+        shared.burst.sleep();
     }
 }
 

@@ -176,22 +176,80 @@ pub fn set_background_priority() {
 
 /// IDs of all running processes.
 pub fn process_ids() -> Vec<u32> {
-    let mut ids = Vec::new();
+    processes().into_iter().map(|(pid, _)| pid).collect()
+}
+
+/// All running processes as (process ID, ID of the process that started it).
+fn processes() -> Vec<(u32, u32)> {
+    let mut all = Vec::new();
     unsafe {
         let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snap == INVALID_HANDLE_VALUE {
-            return ids;
+            return all;
         }
         let mut entry: PROCESSENTRY32W = std::mem::zeroed();
         entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
         let mut ok = Process32FirstW(snap, &mut entry);
         while ok != 0 {
-            ids.push(entry.th32ProcessID);
+            all.push((entry.th32ProcessID, entry.th32ParentProcessID));
             ok = Process32NextW(snap, &mut entry);
         }
         CloseHandle(snap);
     }
-    ids
+    all
+}
+
+unsafe fn created_at(process: HANDLE) -> u64 {
+    let mut times = [FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+    let [created, exited, kernel, user] = &mut times;
+    if unsafe { GetProcessTimes(process, created, exited, kernel, user) } == 0 {
+        return u64::MAX;
+    }
+    (u64::from(created.dwHighDateTime) << 32) | u64::from(created.dwLowDateTime)
+}
+
+/// Ends everything the process `root` (created at `root_created`) started, and what
+/// those started in turn. Parent IDs outlive their processes and get reused, so a
+/// process only counts as a child if it started after its parent. Returns false if one
+/// of them could not be stopped.
+unsafe fn stop_descendants(root: u32, root_created: u64) -> bool {
+    let mut all = true;
+    let mut parents = vec![(root, root_created)];
+    let mut seen = std::collections::HashSet::new();
+    // A child may have started another process while the previous round ended it.
+    for _ in 0..3 {
+        let snapshot = processes();
+        let before = parents.len();
+        let mut i = 0;
+        while i < parents.len() {
+            let (parent, parent_created) = parents[i];
+            i += 1;
+            let children: Vec<u32> = snapshot.iter().filter(|(pid, ppid)| *ppid == parent && *pid != parent && !seen.contains(pid)).map(|(pid, _)| *pid).collect();
+            for pid in children {
+                unsafe {
+                    let mut h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
+                    let can_stop = !h.is_null();
+                    if !can_stop {
+                        h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                        if h.is_null() {
+                            continue;
+                        }
+                    }
+                    let created = created_at(h);
+                    if created >= parent_created && created != u64::MAX {
+                        seen.insert(pid);
+                        parents.push((pid, created));
+                        all &= can_stop && TerminateProcess(h, 1) != 0 && WaitForSingleObject(h, 5000) == WAIT_OBJECT_0;
+                    }
+                    CloseHandle(h);
+                }
+            }
+        }
+        if parents.len() == before {
+            break;
+        }
+    }
+    all
 }
 
 unsafe fn image_of(process: HANDLE) -> Option<PathBuf> {
@@ -424,7 +482,12 @@ pub fn stop_processes_using(file: &Path) -> bool {
                 };
                 if uses {
                     found = true;
+                    let created = created_at(h);
                     all &= TerminateProcess(h, 1) != 0 && WaitForSingleObject(h, 5000) == WAIT_OBJECT_0;
+                    // A script host has likely started the script's next stage already.
+                    if pass == 2 {
+                        all &= stop_descendants(pid, created);
+                    }
                 }
                 CloseHandle(h);
             }
@@ -436,9 +499,9 @@ pub fn stop_processes_using(file: &Path) -> bool {
     all
 }
 
-/// Ends the process `pid` if it still runs `command_line`, so a reused PID is never hit.
-/// `None` when it has exited already, `Some(false)` when it could not be stopped (it runs
-/// elevated).
+/// Ends the process `pid` if it still runs `command_line` (so a reused PID is never hit),
+/// and everything it started. `None` when it has exited already, `Some(false)` when it
+/// or one of its children could not be stopped (they run elevated).
 pub fn stop_process(pid: u32, command_line: &str) -> Option<bool> {
     unsafe {
         let mut h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
@@ -449,10 +512,14 @@ pub fn stop_process(pid: u32, command_line: &str) -> Option<bool> {
                 return None;
             }
         }
-        let same = command_line_of(h).is_some_and(|l| l == command_line);
-        let stopped = same && can_stop && TerminateProcess(h, 1) != 0 && WaitForSingleObject(h, 5000) == WAIT_OBJECT_0;
+        if !command_line_of(h).is_some_and(|l| l == command_line) {
+            CloseHandle(h);
+            return None;
+        }
+        let created = created_at(h);
+        let stopped = can_stop && TerminateProcess(h, 1) != 0 && WaitForSingleObject(h, 5000) == WAIT_OBJECT_0;
         CloseHandle(h);
-        same.then_some(stopped)
+        Some(stop_descendants(pid, created) && stopped)
     }
 }
 
@@ -630,5 +697,22 @@ mod tests {
         assert_eq!(process_args(me), Some(std::env::args().collect()));
         // Only the process still running the scanned command is stopped.
         assert_eq!(stop_process(me, "some other command"), None);
+    }
+
+    #[test]
+    fn stopping_a_script_host_stops_what_it_started() {
+        let mut host = Command::new("cmd.exe").args(["/c", "ping -n 30 127.0.0.1 >nul"]).creation_flags(CREATE_NO_WINDOW).spawn().unwrap();
+        let pid = host.id();
+        let is_ping = |p: u32| process_image(p).is_some_and(|i| i.file_name().is_some_and(|n| n.eq_ignore_ascii_case("PING.EXE")));
+        let ping = (0..50)
+            .find_map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                processes().into_iter().find(|&(p, parent)| parent == pid && is_ping(p)).map(|(p, _)| p)
+            })
+            .expect("cmd started ping");
+        let line = process_command_line(pid).unwrap();
+        assert_eq!(stop_process(pid, &line), Some(true));
+        host.wait().unwrap();
+        assert!(!is_ping(ping), "ping outlived the cmd that started it");
     }
 }

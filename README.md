@@ -129,17 +129,26 @@ Malicious files are quarantined automatically (configurable). If the file is a p
 running, Vigil stops every process running it first, since Windows locks a running program's file.
 When a file can't be moved (it is in use, or its program runs as administrator), Vigil tries again
 every 30 seconds for ten minutes, and a malicious program is checked again every time it starts.
-Suspicious files only trigger a notification.
+Suspicious files only trigger a notification. Quarantined files are XOR-encoded in
+`%LOCALAPPDATA%\Vigil\quarantine` so they can't run by accident. Restoring a file also marks it as safe.
 
 PowerShell, `cmd`, `mshta`, Windows Script Host and `conhost` run code given on their command
 line, which never touches the disk, so the command line of each one that starts is scanned like
 a script, and so is the script file it is told to run (`-File x.ps1`, `wscript x.vbs`,
 `cmd /c x.bat`). A hidden window or `-ExecutionPolicy Bypass` alone is normal for installers and
 background tools and only adds a few points; a hidden window that makes a web request is
-suspicious, and one that downloads and runs code is malicious. A malicious command gets that one
-process stopped (nothing is quarantined, since the program is Windows' own), and *Mark as safe*
-allows that exact command line. Quarantined files are XOR-encoded in `%LOCALAPPDATA%\Vigil\quarantine` so they
-can't run by accident. Restoring a file also marks it as safe.
+suspicious, and one that downloads and runs code is malicious. A malicious command gets that
+process and everything it started stopped (nothing is quarantined, since the program is Windows'
+own), and *Mark as safe* allows that exact command line.
+
+Droppers write a script and run it straight away, so scripts that Windows runs on a double-click
+or at login (`.bat`, `.cmd`, `.ps1`, `.vbs`, `.hta`, `.lnk`…) are scanned the moment they are saved
+anywhere in your user folders (Documents, Desktop, AppData, Temp, Startup). `.js` and `.py` are
+left out there, since developer tools write thousands of them. A new script there, or a script
+host starting, also makes the program-start check poll every 50 ms instead of once a second for
+the next five seconds. PowerShell needs about 110 ms after it starts before it runs the first line
+of its command, so a hidden PowerShell started by a freshly written script is stopped before it
+runs anything: in testing, 40 to 80 ms after it started, every time.
 
 The rules are obfuscated at build time (`build.rs`), so `vigil.exe` does not contain the
 plaintext malware indicators. Otherwise Defender or Vigil itself could flag it.
@@ -247,9 +256,12 @@ and [MITRE ATT&CK obfuscation techniques](https://attack.mitre.org/techniques/T1
 - The program-start check is a static scan of the program file when it starts, not runtime
   behavior monitoring. Vigil checks the process list once a second without admin rights, so the
   program is already running when it is scanned, and one that starts and exits within a second
-  can be missed. That matters most for script hosts: a one-line PowerShell command that
-  finishes within a second can be missed, and one that is caught has already started. Programs
-  running as administrator cannot be stopped; Vigil notifies you instead.
+  can be missed. Fast polling narrows that to 50 ms around script activity, but only after a
+  script was saved in a user folder or a script host was seen: a command started directly by
+  another program (a Run key, a scheduled task, a dropper's own process) can still run for up to
+  a second before it is checked. A check costs about 5 ms of CPU, so during those five seconds of
+  fast polling Vigil uses about a tenth of one core. Programs running as administrator cannot be
+  stopped; Vigil notifies you instead.
   DLLs are only checked for `rundll32.exe` and `regsvr32.exe`, and only under those names:
   DLLs that other programs load (DLL sideloading) and renamed copies of these hosts are not.
 

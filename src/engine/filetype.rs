@@ -45,6 +45,10 @@ const DECOY_EXTS: &[&str] = &[
     "avi", "mov", "wav", "zip", "rar", "7z",
 ];
 const RISKY_EXTS: &[&str] = &["scr", "pif", "cpl", "hta", "jse", "vbe", "wsf", "wsh", "js", "vbs"];
+/// Script types Windows runs on a double-click or at login, scanned the moment one is saved
+/// anywhere in the user's folders. `.js` and `.py` are left out: developer tools write
+/// thousands of them (node_modules, virtual environments).
+pub const USER_SCRIPT_EXTS: &[&str] = &["bat", "cmd", "ps1", "vbs", "vbe", "jse", "wsf", "wsh", "hta", "lnk"];
 /// Temporary files browsers write while a download is in progress.
 pub const TEMP_EXTS: &[&str] = &["crdownload", "part", "partial", "download", "tmp", "opdownload", "!ut", "aria2"];
 

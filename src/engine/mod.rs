@@ -92,6 +92,9 @@ pub enum Source {
     Folder,
     Manual,
     Launch,
+    /// A script saved somewhere in the user's own folders (Documents, Desktop, AppData,
+    /// Temp, Startup), where droppers put their next stage.
+    UserFolder,
 }
 
 impl Source {
@@ -104,6 +107,7 @@ impl Source {
             Source::Folder => "Watched folder",
             Source::Manual => "Manual scan",
             Source::Launch => "Program started",
+            Source::UserFolder => "User folder",
         }
     }
 
