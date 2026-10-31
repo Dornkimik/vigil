@@ -221,7 +221,8 @@ pub fn script_file(image: &Path, args: &[String]) -> Option<PathBuf> {
         "mshta.exe" => rest.first()?,
         "cmd.exe" => {
             let i = rest.iter().position(|a| a.eq_ignore_ascii_case("/c") || a.eq_ignore_ascii_case("/k"))?;
-            let arg = rest.get(i + 1)?;
+            // ShellExecute on a .bat passes `/c ""C:\x\s.bat" "`, which splits into `C:\x\s.bat `.
+            let arg = rest.get(i + 1)?.trim_end();
             let lower = arg.to_ascii_lowercase();
             if !lower.ends_with(".bat") && !lower.ends_with(".cmd") {
                 return None;
@@ -230,7 +231,7 @@ pub fn script_file(image: &Path, args: &[String]) -> Option<PathBuf> {
         }
         _ => return None,
     };
-    let path = Path::new(named.trim_matches(['"', '\'']));
+    let path = Path::new(named.trim().trim_matches(['"', '\'']));
     path.is_absolute().then(|| path.to_path_buf())
 }
 
@@ -336,6 +337,8 @@ mod tests {
         assert_eq!(file(r"C:\Windows\System32\mshta.exe", &["mshta", "http://example.invalid/a.hta"]), None);
         assert_eq!(file(r"C:\Windows\System32\mshta.exe", &["mshta", r"C:\Users\me\a.hta"]), Some(PathBuf::from(r"C:\Users\me\a.hta")));
         assert_eq!(file(r"C:\Windows\System32\cmd.exe", &["cmd", "/q", "/c", r"C:\Users\me\run.bat", "arg"]), Some(PathBuf::from(r"C:\Users\me\run.bat")));
+        // How cmd is started when a program opens a .bat (ShellExecute).
+        assert_eq!(file(r"C:\Windows\System32\cmd.exe", &["cmd", "/c", r"C:\Users\me\Documents\s.bat "]), Some(PathBuf::from(r"C:\Users\me\Documents\s.bat")));
         assert_eq!(file(r"C:\Windows\System32\cmd.exe", &["cmd", "/c", "echo", "hi"]), None);
         assert_eq!(file(r"C:\Windows\notepad.exe", &["notepad", r"C:\a.ps1"]), None);
     }
