@@ -521,10 +521,12 @@ impl App {
             for e in self.events.iter().take(6) {
                 ui.horizontal(|ui| {
                     ui.add_sized([96.0, 22.0], |ui: &mut Ui| chip(ui, e.report.verdict.label(), verdict_color(e.report.verdict)));
-                    ui.add(egui::Label::new(RichText::new(&e.report.name).family(semibold())).truncate());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         ui.label(RichText::new(ago(e.time)).color(FAINT).size(12.5));
                         ui.label(RichText::new(action_label(e.action)).color(DIM).size(12.5));
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(egui::Label::new(RichText::new(&e.report.name).family(semibold())).truncate());
+                        });
                     });
                 });
             }
@@ -763,11 +765,13 @@ impl App {
             let mut remove = None;
             for (i, f) in self.config.extra_folders.iter().enumerate() {
                 ui.horizontal(|ui| {
-                    ui.add(egui::Label::new(f.display().to_string()).truncate());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if button(ui, "Remove").clicked() {
                             remove = Some(i);
                         }
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(egui::Label::new(f.display().to_string()).truncate());
+                        });
                     });
                 });
             }
@@ -902,7 +906,7 @@ impl App {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.add_sized([96.0, 22.0], |ui: &mut Ui| chip(ui, r.verdict.label(), verdict_color(r.verdict)));
-                ui.add(egui::Label::new(RichText::new(&r.name).family(semibold())).truncate());
+                // Right-hand labels go first so the name truncates into the space they leave.
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.link(RichText::new(if open { "Hide" } else { "Details" }).color(DIM).size(12.5)).clicked() {
                         if open {
@@ -917,6 +921,9 @@ impl App {
                             ui.label(RichText::new(action_label(e.action)).color(action_color(e.action)).size(12.5));
                         }
                     }
+                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        ui.add(egui::Label::new(RichText::new(&r.name).family(semibold())).truncate());
+                    });
                 });
             });
             let mut meta = vec![r.kind.label().to_string(), human_size(r.size)];
