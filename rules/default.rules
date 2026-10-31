@@ -8,6 +8,9 @@
 #     require <pattern> | <alternative>  (each require line must have a hit)
 #     scope  any | pe | script | shortcut   (default: any)
 #     case   exact                          (optional: case-sensitive matching)
+#     near   <bytes>     (optional: everything above must be met within one window
+#                         of this many bytes, not just anywhere in a big file)
+#     mask   <pattern>   (optional: hits inside an occurrence of this don't count)
 #     str    <pattern>   (case-insensitive; also matched as UTF-16 and with
 #                         doubled backslashes, so .NET and script sources hit too)
 #   end
@@ -138,12 +141,21 @@ end
 
 # ---------------------------------------------------------------- loaders / droppers
 
+# Editors, terminals and browsers ship lists of PowerShell command names (allow/deny
+# lists, syntax tables, Chrome's paste-and-run checks); a list entry is data, not a download.
 rule loader.download_cradle
   desc   Downloads and executes code (PowerShell / LOLBin download cradle)
   weight 35
   min    2
-  require DownloadString | DownloadData | Invoke-WebRequest | requests.get( | urlopen( | curl http | curl.exe http
-  require Invoke-Expression | IEX( | IEX ( | IEX $ | 'IEX' | "IEX" | | IEX | exec( | eval( | ScriptBlock]::Create
+  require DownloadString | DownloadData | Invoke-WebRequest
+  require Invoke-Expression | IEX( | IEX ( | IEX $ | 'IEX' | "IEX" | | IEX | ScriptBlock]::Create
+  mask   "Invoke-WebRequest",
+  mask   "Invoke-WebRequest"]
+  mask   "Invoke-WebRequest":
+  mask   'Invoke-WebRequest',
+  mask   'Invoke-WebRequest']
+  mask   'Invoke-WebRequest':
+  mask   ,Invoke-WebRequest,
   str    DownloadString(
   str    DownloadFile(
   str    DownloadData(
@@ -163,6 +175,28 @@ rule loader.download_cradle
   str    certutil -decode
   str    mshta http
   str    Start-BitsTransfer
+end
+
+# curl | iex. Bundles and docs for local HTTP APIs are full of "curl http://localhost",
+# so curl only counts right next to the execution.
+rule loader.curl_cradle
+  desc   Downloads code with curl and runs it with PowerShell
+  weight 35
+  near   256
+  require curl http | curl.exe http
+  require Invoke-Expression | IEX( | IEX ( | IEX $ | | IEX | ScriptBlock]::Create
+end
+
+# exec(requests.get(url).text) and friends. These names are everywhere in large
+# JS bundles (RegExp .exec(), a Map called requests) and Python's own test suite,
+# so they only count when they sit together.
+rule loader.script_cradle
+  desc   Downloads code and runs it with exec/eval
+  weight 35
+  scope  script
+  near   256
+  require requests.get( | urlopen(
+  require exec( | eval(
 end
 
 rule loader.script_dropper
@@ -221,7 +255,115 @@ rule evasion.defender_tamper
   weight 25
   min    1
   require Add-MpPreference | Set-MpPreference
-  require -ExclusionPath | -ExclusionProcess | -ExclusionExtension | -DisableRealtimeMonitoring $true | -DisableRealtimeMonitoring 1
+  require -ExclusionPath | -ExclusionProcess | -ExclusionExtension | -DisableRealtimeMonitoring $true | -DisableRealtimeMonitoring 1 | -DisableRealtimeMonitoring:$true | -DisableBehaviorMonitoring $true | -DisableIOAVProtection $true | -DisableScriptScanning $true | -DisableBlockAtFirstSeen $true | -MAPSReporting 0 | -MAPSReporting Disabled | -SubmitSamplesConsent 2 | -SubmitSamplesConsent NeverSend
+end
+
+# The same switches set through Group Policy registry values, which Defender also obeys.
+rule evasion.defender_policy
+  desc   Turns off Microsoft Defender through its policy registry keys
+  weight 25
+  require \Policies\Microsoft\Windows Defender
+  require DisableAntiSpyware | DisableRealtimeMonitoring | DisableBehaviorMonitoring | DisableIOAVProtection | DisableOnAccessProtection | DisableScanOnRealtimeEnable | DisableAntiVirus
+end
+
+rule evasion.defender_exclusion_key
+  desc   Writes Microsoft Defender exclusions directly into the registry
+  weight 25
+  min    1
+  str    \Windows Defender\Exclusions\Paths
+  str    \Windows Defender\Exclusions\Processes
+  str    \Windows Defender\Exclusions\Extensions
+end
+
+rule evasion.defender_service
+  desc   Stops the Defender service or removes its malware definitions
+  weight 25
+  min    1
+  str    sc stop WinDefend
+  str    sc.exe stop WinDefend
+  str    sc config WinDefend
+  str    sc.exe config WinDefend
+  str    sc delete WinDefend
+  str    Stop-Service WinDefend
+  str    -RemoveDefinitions -All
+end
+
+rule evasion.log_clearing
+  desc   Clears Windows event logs or the file-change journal to hide its tracks
+  weight 25
+  min    1
+  str    wevtutil cl
+  str    wevtutil.exe cl
+  str    wevtutil clear-log
+  str    Clear-EventLog
+  str    GlobalSession.ClearLog
+  str    fsutil usn deletejournal
+end
+
+# Opening single ports is normal for games and servers; only switching the firewall off counts.
+rule evasion.firewall_off
+  desc   Turns off Windows Firewall
+  weight 20
+  min    1
+  str    advfirewall set allprofiles state off
+  str    advfirewall set currentprofile state off
+  str    advfirewall set publicprofile state off
+  str    advfirewall set privateprofile state off
+  str    firewall set opmode disable
+  str    firewall set opmode mode=disable
+  str    Set-NetFirewallProfile -All -Enabled False
+  str    Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+end
+
+# Reflection into PowerShell's own logging settings, so script block logging stops recording.
+rule evasion.script_logging_tamper
+  desc   Disables PowerShell script logging from inside the script
+  weight 35
+  scope  script
+  require System.Management.Automation.Utils | PSEtwLogProvider
+  require cachedGroupPolicySettings | etwProvider | m_enabled
+  require NonPublic
+end
+
+# Overwriting the start of EtwEventWrite blinds tools that watch Event Tracing for Windows.
+rule evasion.etw_patch
+  desc   Patches Event Tracing for Windows in memory so security tools stop seeing events
+  weight 35
+  scope  script
+  require EtwEventWrite | NtTraceEvent
+  require VirtualProtect | NtProtectVirtualMemory
+  require Marshal]::Copy | Marshal.Copy | Marshal]::WriteByte | WriteProcessMemory | ctypes.memmove
+end
+
+# PowerShell 2.0 predates AMSI and script logging.
+rule evasion.powershell_downgrade
+  desc   Starts the old PowerShell 2.0 engine, which has no AMSI scanning or script logging
+  weight 20
+  min    1
+  str    powershell -version 2
+  str    powershell.exe -version 2
+  str    powershell -v 2
+  str    powershell.exe -v 2
+end
+
+# Security tools hook ntdll in each process. A fresh copy read from disk replaces those hooks.
+rule evasion.ntdll_unhook
+  desc   Maps a clean copy of ntdll.dll over the loaded one to remove security hooks
+  weight 25
+  require \KnownDlls\ntdll.dll | \System32\ntdll.dll | \SysWOW64\ntdll.dll
+  require .text
+  require VirtualProtect | NtProtectVirtualMemory
+  require MapViewOfFile | NtMapViewOfSection | ReadAllBytes(
+end
+
+# Bring your own vulnerable driver: a legitimately signed driver with a known bug is loaded
+# to get kernel access and kill security software. The tools that ship these drivers are
+# signed, so the signature credit keeps them clean.
+rule evasion.byovd
+  desc   Installs a known-vulnerable kernel driver (used to kill security software)
+  weight 30
+  require sc create | sc.exe create | New-Service | CreateService | NtLoadDriver | ZwLoadDriver
+  require RTCore64.sys | gdrv.sys | dbutil_2_3.sys | mhyprot2.sys | aswArPot.sys | zam64.sys | zamguard64.sys | kprocesshacker.sys | iqvw64e.sys | truesight.sys | procexp152.sys
 end
 
 rule evasion.uac_bypass
@@ -341,6 +483,21 @@ rule impact.hidden_desktop
   require PrintWindow | BitBlt
 end
 
+# Electron apps, CEF and Chrome contain a whole browser, whose sandbox, screen capture
+# and input handling match the API-shape rules above. The engine only treats this as
+# a browser engine in binaries far larger than malware (see engine::BROWSER_ENGINE_SIZE).
+rule info.chromium_engine
+  desc   Contains the Chromium browser engine (Electron, CEF or Chrome)
+  weight 0
+  min    3
+  scope  pe
+  case   exact
+  str    Chrome_WidgetWin_
+  str    v8_context_snapshot
+  str    chrome-extension://
+  str    chrome://gpu
+end
+
 # Capability combinations, rather than individual API/tool names.
 rule loader.memory_payload
   desc   Decodes a payload and loads it as an in-memory assembly
@@ -392,10 +549,23 @@ rule impact.reverse_shell
   desc   Script combines a TCP command channel, command execution and a response stream
   weight 55
   scope  script
-  require Net.Sockets.TCPClient | socket.socket(
-  require GetStream( | .recv(
-  require Invoke-Expression | IEX( | IEX $ | subprocess.Popen( | os.popen(
-  require .Write( | .send( | .sendall(
+  require Net.Sockets.TCPClient
+  require GetStream(
+  require Invoke-Expression | IEX( | IEX $
+  require .Write(
+end
+
+# Sockets and subprocesses meet all over Python test suites and tooling, so the
+# Python form only counts as one compact block.
+rule impact.python_reverse_shell
+  desc   Script connects a TCP socket to a command shell
+  weight 55
+  scope  script
+  near   1024
+  require socket.socket(
+  require .recv(
+  require subprocess.Popen( | os.popen(
+  require .send( | .sendall(
 end
 
 rule impact.miner_evasion

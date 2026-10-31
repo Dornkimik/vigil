@@ -2,6 +2,7 @@
 
 use super::Finding;
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
@@ -109,6 +110,51 @@ pub fn name_findings(name: &str, kind: Kind) -> Vec<Finding> {
         _ => {}
     }
     f
+}
+
+/// Core Windows programs. Malware takes these names so it blends into the process list.
+const SYSTEM_PROGRAMS: &[&str] = &[
+    "svchost.exe", "lsass.exe", "csrss.exe", "smss.exe", "wininit.exe", "winlogon.exe", "services.exe", "spoolsv.exe",
+    "dllhost.exe", "conhost.exe", "taskhostw.exe", "runtimebroker.exe", "sihost.exe", "fontdrvhost.exe", "dwm.exe",
+    "ctfmon.exe", "searchindexer.exe", "wuauclt.exe", "explorer.exe", "rundll32.exe", "regsvr32.exe",
+];
+
+/// Folders under %SystemRoot% that standard users can create files in. Malware runs from
+/// these to get past tools that trust everything in the Windows folder.
+const USER_WRITABLE: &[&str] = &[
+    r"\tasks\",
+    r"\temp\",
+    r"\tracing\",
+    r"\debug\wia\",
+    r"\pla\",
+    r"\registration\crmlog\",
+    r"\system32\fxstmp\",
+    r"\system32\com\dmp\",
+    r"\system32\microsoft\crypto\rsa\machinekeys\",
+    r"\system32\spool\drivers\color\",
+    r"\system32\spool\printers\",
+    r"\system32\spool\servers\",
+    r"\system32\tasks\",
+    r"\system32\tasks_migrated\",
+    r"\syswow64\fxstmp\",
+    r"\syswow64\com\dmp\",
+    r"\syswow64\tasks\",
+];
+
+/// True for files under %SystemRoot% that only Windows itself can write, i.e. not
+/// in one of the user-writable folders above.
+pub fn in_protected_windows_folder(path: &Path, system_root: &str) -> bool {
+    let path = path.to_string_lossy().to_ascii_lowercase();
+    let root = system_root.trim_end_matches('\\').to_ascii_lowercase();
+    path.strip_prefix(&root)
+        .is_some_and(|rest| rest.starts_with('\\') && !USER_WRITABLE.iter().any(|dir| rest.starts_with(dir)))
+}
+
+/// A program named like a core Windows process, stored somewhere Windows doesn't keep them.
+pub fn impostor_finding(path: &Path, system_root: &str) -> Option<Finding> {
+    let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+    (SYSTEM_PROGRAMS.contains(&name.as_str()) && !in_protected_windows_folder(path, system_root))
+        .then(|| Finding::new("name.system_impostor", format!("Uses the name of a Windows system program ({name}) outside the Windows folder"), 30))
 }
 
 /// Script-only obfuscation heuristics.
