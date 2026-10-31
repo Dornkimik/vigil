@@ -8,6 +8,7 @@
 //!   vigil.exe --scan <paths>  scan from the command line [--json] [--fast] [--out <file>]
 //!                             (--fast only opens code-like extensions, as for Steam folders)
 //!   vigil.exe --update-hashes download the MalwareBazaar hash database now
+//!   vigil.exe --update-yara   download and compile the YARA Forge rules now
 
 mod config;
 mod daemon;
@@ -28,6 +29,7 @@ fn main() {
         Some("--gui") => gui::run(),
         Some("--scan") => std::process::exit(cli_scan(&args[1..])),
         Some("--update-hashes") => std::process::exit(cli_update_hashes()),
+        Some("--update-yara") => std::process::exit(cli_update_yara()),
         _ if winapi::NamedMutex::exists(daemon::DAEMON_MUTEX) => gui::run(),
         _ => daemon::run(true),
     }
@@ -67,6 +69,23 @@ fn cli_update_hashes() -> i32 {
         }
         Err(e) => {
             println!("Hash database update failed: {e}");
+            1
+        }
+    }
+}
+
+fn cli_update_yara() -> i32 {
+    winapi::attach_parent_console();
+    match engine::yara::update(true, false) {
+        Ok(n) => {
+            println!("YARA rules updated: {n} rules");
+            if let Some(warning) = engine::yara::Meta::load().error {
+                println!("Warning: {warning}");
+            }
+            0
+        }
+        Err(e) => {
+            println!("YARA rule update failed: {e}");
             1
         }
     }

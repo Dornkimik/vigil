@@ -6,7 +6,7 @@ pub mod tray;
 
 use crate::config::{self, Config};
 use crate::engine::filetype::{TEMP_EXTS, ext_of};
-use crate::engine::{Engine, Report, ScanOptions, Source, Verdict, hashdb};
+use crate::engine::{Engine, Report, ScanOptions, Source, Verdict, hashdb, yara};
 use crate::store::{self, Action, Event, Status, WatchedDir};
 use crate::{steam, winapi};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -141,8 +141,13 @@ fn start_watchers(dirs: &[WatchedDir], tx: &Sender<Work>) -> Vec<RecommendedWatc
 fn supervisor(shared: Arc<Shared>, tx: Sender<Work>) {
     let started = store::now();
     let stamp = || {
-        [config::config_path(), config::custom_rules_path(), config::blocklist_path(), config::hashdb_meta_path()]
-            .map(|p| config::modified(&p))
+        let mut s: Vec<_> =
+            [config::config_path(), config::custom_rules_path(), config::blocklist_path(), config::hashdb_meta_path(), config::yara_meta_path()]
+                .iter()
+                .map(|p| config::modified(p))
+                .collect();
+        s.push(yara::custom_stamp());
+        s
     };
     let mut last_stamp = stamp();
     let mut dirs = desired_watches(&shared.config.read().unwrap());
@@ -186,15 +191,22 @@ fn supervisor(shared: Arc<Shared>, tx: Sender<Work>) {
     }
 }
 
-/// Keeps the offline MalwareBazaar hash database current. A finished update rewrites
-/// hashdb.json, which makes the supervisor load a fresh engine.
+/// Keeps the offline MalwareBazaar hash database and the YARA rules current. A finished
+/// update rewrites hashdb.json / yara.json, which makes the supervisor load a fresh engine.
 fn signature_updater(shared: Arc<Shared>) {
     winapi::set_background_priority();
     thread::sleep(Duration::from_secs(30));
     loop {
-        let key = shared.config.read().unwrap().malwarebazaar_key.clone();
+        let (key, yara_updates) = {
+            let cfg = shared.config.read().unwrap();
+            (cfg.malwarebazaar_key.clone(), cfg.yara_updates)
+        };
         if !key.trim().is_empty() && hashdb::Meta::load().due(store::now()) {
             let _ = hashdb::update(&key, false);
+        }
+        let unusable = shared.engine.read().unwrap().yara().forge_unusable();
+        if yara_updates && yara::Meta::load().due(store::now(), unusable) {
+            let _ = yara::update(false, unusable);
         }
         thread::sleep(Duration::from_secs(60));
     }

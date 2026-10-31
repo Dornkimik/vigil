@@ -22,6 +22,23 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 rfd = "0.17"
 dirs = "7"
 ureq = "3"
+# Modules for sandbox reports, live VirusTotal data, Android and macOS formats are left out.
+yara-x = { version = "1.22", default-features = false, features = [
+    "constant-folding",
+    "exact-atoms",
+    "fast-regexp",
+    "generate-proto-code",
+    "console-module",
+    "dotnet-module",
+    "elf-module",
+    "hash-module",
+    "lnk-module",
+    "math-module",
+    "pe-module",
+    "string-module",
+    "time-module",
+    "zip-module",
+] }
 
 [dependencies.windows-sys]
 version = "0.61"

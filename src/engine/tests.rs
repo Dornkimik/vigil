@@ -11,6 +11,7 @@ fn engine() -> Engine {
         blocklist: HashSet::new(),
         allowlist: HashSet::new(),
         hashdb: None,
+        yara: yara::Yara::default(),
         mb_key: String::new(),
         mb_cache: Mutex::new(HashMap::new()),
         agent: ureq::Agent::new_with_defaults(),
@@ -374,6 +375,29 @@ fn known_hashes_flag_files_that_are_not_windows_code() {
     let _ = std::fs::remove_file(&file);
     drop(engine);
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn yara_rules_flag_programs_and_foreign_executables() {
+    let zip = yara::tests::package(&[("rules.yar", yara::tests::RULES)]);
+    let (rules, _, _) = yara::compile_package(&zip).unwrap();
+    let mut engine = engine();
+    engine.yara = yara::Yara::from_package(rules);
+
+    let (score, findings) = engine.analyze_buffer("tool.exe", b"MZ inert VIGIL-YARA-FAMILY-MARKER", Kind::Pe, 0);
+    assert!(score >= MALICIOUS, "{findings:?}");
+
+    let file = std::env::temp_dir().join(format!("vigil-test-{}-yara.elf", std::process::id()));
+    std::fs::write(&file, b"\x7fELF inert VIGIL-YARA-ELF-MARKER").unwrap();
+    let r = engine.scan_file(&file, ScanOptions { source: Source::Downloads, sniff_all: true }).unwrap();
+    assert!(r.analyzed);
+    assert_eq!(r.verdict, Verdict::Malicious, "{:?}", r.findings);
+    assert!(r.findings.iter().any(|f| f.id == "yara.TEST_Elf_Marker"));
+    // Other non-program files are only hash-checked.
+    std::fs::write(&file, b"plain text VIGIL-YARA-ELF-MARKER").unwrap();
+    let r = engine.scan_file(&file, ScanOptions { source: Source::Downloads, sniff_all: true }).unwrap();
+    assert!(!r.analyzed);
+    let _ = std::fs::remove_file(&file);
 }
 
 #[test]

@@ -22,7 +22,7 @@ Vigil runs as two parts of one small executable:
 
 | Part | What it does | Footprint |
 |---|---|---|
-| Background service (`--background`) | Tray icon, folder watchers, program-start watcher, scanning on a low-priority (background I/O) thread | A few MB of RAM, idle when nothing changes |
+| Background service (`--background`) | Tray icon, folder watchers, program-start watcher, scanning on a low-priority (background I/O) thread | About 15 MB of RAM, about 70 MB once the YARA rules are loaded; idle when nothing changes |
 | Dashboard (`--gui`) | Status, manual scans, activity log, quarantine and settings | Runs only while the window is open |
 
 When you close the dashboard, protection keeps running in the notification area.
@@ -88,7 +88,21 @@ shows every finding that added to the score.
    costs almost no RAM. Until the first download finishes, unsigned files are looked up online
    instead. `vigil.exe --update-hashes` forces an update. You can also put your own SHA-256
    blocklist in `%LOCALAPPDATA%\Vigil\blocklist.txt`.
-8. **Defender cross-check**: the *Ask Defender* button sends a single file to
+8. **YARA rules**: the [YARA Forge](https://github.com/YARAHQ/yara-forge) *core* package
+   (about 5,000 curated rules from public repositories) is downloaded from GitHub once a week
+   and matched offline with [YARA-X](https://github.com/VirusTotal/yara-x). Many of these rules
+   match a malware family's code rather than its text, so they still recognize samples whose
+   strings are encrypted. They run on programs, installers, scripts, shortcuts, ZIP members,
+   and Linux/macOS executables, but not on validly signed programs: the signature credit would
+   cancel a match there anyway, and signed engines and drivers make up most of a game library,
+   so skipping them keeps a full Steam scan about 1.5x as long instead of 3x. A match counts by the rule's `score` and kind: malware-family
+   rules fully (usually enough for *malicious*), generic `SUSP`/`INDICATOR` heuristics at half,
+   dual-use tools (`HKTL`, RMM, vulnerable drivers) at 30 points, and machine-generated code
+   signatures (Malpedia `_Auto` rules) at 25, since those also match library code that games
+   share with malware. The package is compiled in memory and only the compiled, XOR-encoded rules
+   are stored (`yara-*.bin`, about 9 MB). `vigil.exe --update-yara` forces an update. Updates can
+   be turned off in Settings.
+9. **Defender cross-check**: the *Ask Defender* button sends a single file to
    `MpCmdRun.exe` for a second opinion. Defender does not remediate during this check.
 
 Malicious files are quarantined automatically (configurable). If the file is a program that is
@@ -126,6 +140,7 @@ This starts the background service and opens the dashboard. In the dashboard, go
 | `vigil.exe --gui` | Dashboard only |
 | `vigil.exe --scan <paths…> [--fast] [--json] [--out file]` | Command-line scan. Exit code 0 = clean, 1 = suspicious, 2 = malicious |
 | `vigil.exe --update-hashes` | Download the MalwareBazaar hash database now (needs the Auth-Key) |
+| `vigil.exe --update-yara` | Download and compile the YARA Forge rules now |
 
 Tray icon: left-click opens the dashboard. Right-click shows *Scan Downloads now*,
 *Pause protection* and *Exit*.
@@ -165,6 +180,25 @@ Alternatives are separated by ` | ` (with spaces). Required patterns count towar
 `min`, which defaults to 1. Repeated patterns and repeated encodings do not increase
 the match count. Existing rules using only `str` and `min` remain supported.
 
+### Your own YARA rules
+
+Put `.yar` or `.yara` files in `%LOCALAPPDATA%\Vigil\yara` (**Settings → YARA rules → Open
+folder**). Each file gets its own namespace, and a file with errors is reported in Settings
+without affecting the others. A match counts by the rule's `score` meta value (75, enough for
+*malicious*, when there is none), adjusted by the naming rules above:
+
+```
+rule MAL_Example_Loader {
+  meta:
+    description = "Example loader"
+    score = 80
+  strings:
+    $a = "some unique string"
+  condition:
+    uint16(0) == 0x5A4D and $a
+}
+```
+
 ## Detection regression tests
 
 Run `cargo test --locked`. The fixtures are inert strings and in-memory archives;
@@ -185,6 +219,10 @@ and [MITRE ATT&CK obfuscation techniques](https://attack.mitre.org/techniques/T1
   DLLs are only checked for `rundll32.exe` and `regsvr32.exe`, and only under those names:
   DLLs that other programs load (DLL sideloading) and renamed copies of these hosts are not.
 
+- YARA rules only know families someone has written a rule for. A new or heavily reworked
+  family, or a packer that hides all of the code, still gets past them. Rule packages also
+  carry the licenses of their source repositories, which are listed in each package.
+
 - Static heuristics cannot determine intent or observe runtime behavior. Custom encryption,
   runtime-built strings, arbitrary character-code expressions, native packers, and payloads
   beyond the recovery limits can get through. Script recovery is not a complete language
@@ -203,7 +241,7 @@ and [MITRE ATT&CK obfuscation techniques](https://attack.mitre.org/techniques/T1
 rules/default.rules   detection rules (obfuscated into the binary at build time)
 build.rs              rule obfuscation + generated .ico embedding
 src/engine/           scanner: rules, PE analysis, ZIP inspection, file-type heuristics,
-                      offline MalwareBazaar hash database (hashdb.rs)
+                      offline MalwareBazaar hash database (hashdb.rs), YARA-X rules (yara.rs)
 src/daemon/           background service: watchers, program-start watcher, debounced worker, Win32 tray
 src/gui/              egui dashboard and theme
 src/store.rs          activity log, status heartbeat, quarantine vault

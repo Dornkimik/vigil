@@ -5,7 +5,7 @@ mod theme;
 
 use crate::config::{self, Config};
 use crate::daemon::DAEMON_MUTEX;
-use crate::engine::{Engine, Report, ScanOptions, Source, Verdict, hashdb};
+use crate::engine::{Engine, Report, ScanOptions, Source, Verdict, hashdb, yara};
 use crate::store::{self, Action, Event, QuarantineEntry, Status};
 use crate::winapi::{self, DefenderResult, NamedMutex};
 use crate::{icon, steam};
@@ -146,6 +146,12 @@ struct App {
     hashdb_stamp: Option<SystemTime>,
     /// Result slot of a running "Update now" request.
     hashdb_update: Option<UpdateSlot>,
+    yara: yara::Meta,
+    yara_stamp: Option<SystemTime>,
+    yara_update: Option<UpdateSlot>,
+    /// Rules from the user's own YARA files, and their compile errors.
+    yara_custom: usize,
+    yara_errors: Vec<String>,
     confirm_delete: Option<String>,
     toast: Option<(String, Instant)>,
     title_bar_styled: bool,
@@ -170,6 +176,11 @@ impl App {
             hashdb: hashdb::Meta::default(),
             hashdb_stamp: None,
             hashdb_update: None,
+            yara: yara::Meta::default(),
+            yara_stamp: None,
+            yara_update: None,
+            yara_custom: engine.yara().custom_len(),
+            yara_errors: engine.yara().custom_errors().to_vec(),
             config,
             config_stamp: config::modified(&config::config_path()),
             autostart: winapi::autostart_enabled(),
@@ -224,6 +235,36 @@ impl App {
                 Err(e) => self.notify(format!("Hash database update failed: {e}")),
             }
         }
+        let ys = config::modified(&config::yara_meta_path());
+        if force || ys != self.yara_stamp {
+            self.yara_stamp = ys;
+            self.yara = yara::Meta::load();
+        }
+        let finished = self.yara_update.as_ref().and_then(|slot| slot.lock().unwrap().take());
+        if let Some(result) = finished {
+            self.yara_update = None;
+            match result {
+                Ok(n) => self.notify(format!("YARA rules updated: {n} rules")),
+                Err(e) => self.notify(format!("YARA rule update failed: {e}")),
+            }
+        }
+    }
+
+    fn update_yara(&mut self) {
+        if self.yara_update.is_some() {
+            return;
+        }
+        let slot = Arc::new(Mutex::new(None));
+        let s = slot.clone();
+        std::thread::spawn(move || *s.lock().unwrap() = Some(yara::update(true, false)));
+        self.yara_update = Some(slot);
+    }
+
+    /// Recompiles the user's own YARA files to show their status.
+    fn reload_custom_yara(&mut self) {
+        let y = yara::Yara::load();
+        self.yara_custom = y.custom_len();
+        self.yara_errors = y.custom_errors().to_vec();
     }
 
     fn update_hashdb(&mut self) {
@@ -839,6 +880,63 @@ impl App {
                     let ready = self.hashdb_update.is_none() && !self.config.malwarebazaar_key.is_empty();
                     if ui.add_enabled_ui(ready, |ui| button(ui, "Update now")).inner.clicked() {
                         self.update_hashdb();
+                    }
+                });
+            });
+        });
+        ui.add_space(12.0);
+
+        card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section_label(ui, "YARA rules");
+            ui.add_space(6.0);
+            ui.label(
+                RichText::new(
+                    "Community rules (the YARA Forge core package) that recognize malware families by code patterns, \
+                     which often survive obfuscation. Matching runs on your PC; only the rule package is downloaded from GitHub.",
+                )
+                .color(DIM),
+            );
+            let mut updates = self.config.yara_updates;
+            if toggle_row(ui, "Download rule updates", "Fetch the latest package once a week.", &mut updates) {
+                let first = updates && self.yara.rules == 0;
+                self.update_config(|c| c.yara_updates = updates);
+                if first {
+                    self.update_yara();
+                }
+            }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let status = if self.yara_update.is_some() {
+                    "Downloading and compiling the YARA rules...".to_string()
+                } else if self.yara.rules > 0 {
+                    format!("{} rules, updated {}", self.yara.rules, ago(self.yara.synced))
+                } else {
+                    "No YARA rules downloaded yet.".to_string()
+                };
+                ui.label(RichText::new(status).color(DIM).size(12.5));
+                if let Some(e) = &self.yara.error {
+                    ui.label(RichText::new(format!("Last update: {e}")).color(FAINT).size(12.5));
+                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.add_enabled_ui(self.yara_update.is_none(), |ui| button(ui, "Update now")).inner.clicked() {
+                        self.update_yara();
+                    }
+                });
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let mut own = format!("Your own rules: {} from .yar files in the yara folder.", self.yara_custom);
+                if let Some(first) = self.yara_errors.first() {
+                    own += &format!(" {} file(s) have errors, e.g. {first}", self.yara_errors.len());
+                }
+                ui.label(RichText::new(own).color(DIM).size(12.5));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if button(ui, "Reload").on_hover_text("Recompile your own rules to check them").clicked() {
+                        self.reload_custom_yara();
+                    }
+                    if button(ui, "Open folder").clicked() {
+                        winapi::open_folder(&config::yara_dir());
                     }
                 });
             });

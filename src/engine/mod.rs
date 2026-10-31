@@ -9,6 +9,7 @@ pub mod pe;
 pub mod rules;
 #[cfg(test)]
 mod tests;
+pub mod yara;
 
 use crate::config::{self, Config};
 use crate::winapi::{self, InvalidReason, Signature};
@@ -157,6 +158,7 @@ pub struct Engine {
     blocklist: HashSet<String>,
     allowlist: HashSet<String>,
     hashdb: Option<hashdb::HashDb>,
+    yara: yara::Yara,
     mb_key: String,
     mb_cache: Mutex<HashMap<String, Option<String>>>,
     agent: ureq::Agent,
@@ -179,6 +181,7 @@ impl Engine {
             blocklist,
             allowlist: cfg.allowlist.iter().map(|h| h.to_ascii_lowercase()).collect(),
             hashdb: hashdb::HashDb::open_current(),
+            yara: yara::Yara::load(),
             mb_key: cfg.malwarebazaar_key.trim().to_string(),
             mb_cache: Mutex::new(HashMap::new()),
             agent,
@@ -191,6 +194,10 @@ impl Engine {
 
     pub fn rule_errors(&self) -> &[String] {
         &self.rule_errors
+    }
+
+    pub fn yara(&self) -> &yara::Yara {
+        &self.yara
     }
 
     /// Local known-bad checks: the user's blocklist and the offline MalwareBazaar database.
@@ -224,14 +231,23 @@ impl Engine {
             // Nothing to analyze, but known samples (Linux/macOS/Android malware, payloads
             // under a harmless name) are still flagged. Steam's asset files stay unread.
             if opts.sniff_all && r.size <= MAX_CONTENT_SCAN {
-                let h = sha256_stream(File::open(path)?)?;
-                if let Some(f) = self.known_hash(&h).filter(|_| !self.allowlist.contains(&h)) {
+                let file = File::open(path)?;
+                // SAFETY: read-only mapping; Windows refuses to truncate a mapped file.
+                let map = unsafe { memmap2::Mmap::map(&file)? };
+                let h = hex(&Sha256::digest(&map[..]));
+                let mut findings: Vec<Finding> = self.known_hash(&h).into_iter().collect();
+                // Programs for Linux and macOS can't run here, but YARA rules still recognize them.
+                if findings.is_empty() && filetype::is_foreign_executable(&head[..n]) {
+                    findings = self.yara.scan(&map);
+                }
+                let score = findings.iter().map(|f| f.weight).sum::<i32>().max(0);
+                if score > 0 && !self.allowlist.contains(&h) {
                     r.analyzed = true;
                     r.origin = origin(path);
                     r.sha256 = Some(h);
-                    r.score = f.weight;
-                    r.verdict = Verdict::from_score(r.score);
-                    r.findings = vec![f];
+                    r.score = score;
+                    r.verdict = Verdict::from_score(score);
+                    r.findings = findings;
                 }
             }
             return Ok(r);
@@ -270,21 +286,23 @@ impl Engine {
             findings.extend(self.known_hash(h));
         }
 
-        if let Some(m) = &map {
-            let body = if r.size > MAX_CONTENT_SCAN { &m[..pe::image_end(m).min(MAX_CONTENT_SCAN as usize)] } else { &m[..] };
-            findings.extend(self.analyze_buffer(&r.name, body, r.kind, 0).1);
-            if body.len() < m.len() && !findings.iter().any(|f| f.id == "pe.inflated") {
-                findings.extend(pe::inflated(m));
-            }
-        }
-        drop(map);
-
         if matches!(r.kind, Kind::Pe | Kind::Installer) {
             match winapi::verify_signature(path) {
                 Signature::Valid(s) => r.signer = Some(s),
                 sig => findings.extend(signature_finding(&sig, r.kind, opts.source)),
             }
         }
+
+        if let Some(m) = &map {
+            let body = if r.size > MAX_CONTENT_SCAN { &m[..pe::image_end(m).min(MAX_CONTENT_SCAN as usize)] } else { &m[..] };
+            // The signature credit below would cancel a YARA match on a signed program, and
+            // signed engines and drivers are the bulk of a Steam library: skip it there.
+            findings.extend(self.analyze(&r.name, body, r.kind, 0, r.signer.is_none()).1);
+            if body.len() < m.len() && !findings.iter().any(|f| f.id == "pe.inflated") {
+                findings.extend(pe::inflated(m));
+            }
+        }
+        drop(map);
 
         let mut known_bad = findings.iter().any(|f| f.id.starts_with("hash."));
         // Online lookups only bridge the gap until the offline database has been downloaded.
@@ -318,6 +336,10 @@ impl Engine {
 
     /// Content heuristics for an in-memory buffer (a file or an archive member).
     pub(crate) fn analyze_buffer(&self, name: &str, data: &[u8], kind: Kind, depth: u32) -> (i32, Vec<Finding>) {
+        self.analyze(name, data, kind, depth, true)
+    }
+
+    fn analyze(&self, name: &str, data: &[u8], kind: Kind, depth: u32, yara: bool) -> (i32, Vec<Finding>) {
         let mut findings = Vec::new();
         let mut browser_engine = false;
         let scope = match kind {
@@ -333,6 +355,9 @@ impl Engine {
                 _ => Vec::new(),
             };
             let matches = if views.is_empty() { self.rules.scan(data, scope) } else { self.rules.scan_views(data, &views, scope) };
+            if yara {
+                findings.extend(self.yara.scan(data));
+            }
             for m in matches {
                 let shown: Vec<&str> = m.matched.iter().take(4).copied().collect();
                 let more = if m.matched.len() > 4 { format!(" +{} more", m.matched.len() - 4) } else { String::new() };

@@ -33,6 +33,15 @@ pub fn blocklist_path() -> PathBuf {
 pub fn hashdb_meta_path() -> PathBuf {
     data_dir().join("hashdb.json")
 }
+pub fn yara_meta_path() -> PathBuf {
+    data_dir().join("yara.json")
+}
+/// The user's own YARA rule files.
+pub fn yara_dir() -> PathBuf {
+    let d = data_dir().join("yara");
+    let _ = std::fs::create_dir_all(&d);
+    d
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -49,6 +58,8 @@ pub struct Config {
     pub paused: bool,
     /// Optional abuse.ch MalwareBazaar Auth-Key, used to download the offline hash database.
     pub malwarebazaar_key: String,
+    /// Download the YARA Forge rule package from GitHub once a week.
+    pub yara_updates: bool,
     /// SHA-256 hashes the user marked as safe.
     pub allowlist: Vec<String>,
 }
@@ -65,6 +76,7 @@ impl Default for Config {
             notifications: true,
             paused: false,
             malwarebazaar_key: String::new(),
+            yara_updates: true,
             allowlist: Vec::new(),
         }
     }

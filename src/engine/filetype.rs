@@ -55,6 +55,13 @@ pub fn is_code_ext(ext: &str) -> bool {
     PE_EXTS.contains(&ext) || SCRIPT_EXTS.contains(&ext) || matches!(ext, "lnk" | "zip" | "msi")
 }
 
+/// ELF (Linux, Android) and Mach-O (macOS) programs. Fat Mach-O binaries are left out:
+/// their magic is shared with Java class files.
+pub fn is_foreign_executable(head: &[u8]) -> bool {
+    const MACHO: [[u8; 4]; 4] = [[0xFE, 0xED, 0xFA, 0xCE], [0xFE, 0xED, 0xFA, 0xCF], [0xCE, 0xFA, 0xED, 0xFE], [0xCF, 0xFA, 0xED, 0xFE]];
+    head.starts_with(b"\x7fELF") || MACHO.iter().any(|m| head.starts_with(m))
+}
+
 pub fn classify(name: &str, head: &[u8]) -> Kind {
     let ext = ext_of(name);
     if head.starts_with(b"MZ") {
