@@ -8,7 +8,7 @@ use crate::daemon::DAEMON_MUTEX;
 use crate::engine::{Engine, Report, ScanOptions, Source, Verdict, hashdb, yara};
 use crate::store::{self, Action, Event, QuarantineEntry, Status};
 use crate::winapi::{self, DefenderResult, NamedMutex};
-use crate::{icon, steam};
+use crate::{admin, icon, steam};
 use eframe::egui::{self, Align, Color32, Layout, RichText, ScrollArea, Ui, vec2};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -118,7 +118,7 @@ enum Intent {
     Delete(QuarantineEntry),
 }
 
-type UpdateSlot = Arc<Mutex<Option<Result<usize, String>>>>;
+type UpdateSlot<T = usize> = Arc<Mutex<Option<Result<T, String>>>>;
 
 struct App {
     page: Page,
@@ -149,6 +149,9 @@ struct App {
     yara: yara::Meta,
     yara_stamp: Option<SystemTime>,
     yara_update: Option<UpdateSlot>,
+    /// Admin mode is turned on, and the result slot of a running request to change it.
+    admin_on: bool,
+    admin_change: Option<UpdateSlot<()>>,
     /// Rules from the user's own YARA files, and their compile errors.
     yara_custom: usize,
     yara_errors: Vec<String>,
@@ -179,6 +182,8 @@ impl App {
             yara: yara::Meta::default(),
             yara_stamp: None,
             yara_update: None,
+            admin_on: admin::installed(),
+            admin_change: None,
             yara_custom: engine.yara().custom_len(),
             yara_errors: engine.yara().custom_errors().to_vec(),
             config,
@@ -248,6 +253,26 @@ impl App {
                 Err(e) => self.notify(format!("YARA rule update failed: {e}")),
             }
         }
+        let finished = self.admin_change.as_ref().and_then(|slot| slot.lock().unwrap().take());
+        if let Some(result) = finished {
+            self.admin_change = None;
+            self.admin_on = admin::installed();
+            match result {
+                Ok(()) => self.notify(if self.admin_on { "Admin mode is on" } else { "Admin mode is off" }),
+                Err(e) => self.notify(e),
+            }
+        }
+    }
+
+    /// Turns admin mode on or off in the background: the UAC prompt waits for the user.
+    fn change_admin_mode(&mut self, enabled: bool) {
+        if self.admin_change.is_some() {
+            return;
+        }
+        let slot = Arc::new(Mutex::new(None));
+        let s = slot.clone();
+        std::thread::spawn(move || *s.lock().unwrap() = Some(admin::set(enabled)));
+        self.admin_change = Some(slot);
     }
 
     fn update_yara(&mut self) {
@@ -760,6 +785,14 @@ impl App {
 
         let mut c = self.config.clone();
         let mut changed = false;
+        let mut admin_on = self.admin_on;
+        let admin_desc = match (self.admin_change.is_some(), self.admin_on, self.status.admin_mode) {
+            (true, ..) => "Waiting for admin approval...",
+            (_, true, true) => "On: every program is checked the instant it starts. A small helper runs as SYSTEM; scanning stays without admin rights.",
+            (_, true, false) => "On, but the helper is not connected yet. It starts with Windows.",
+            _ => "Check every program the instant it starts instead of within a second. Asks for admin approval once; a small helper then runs as SYSTEM.",
+        };
+        let mut admin_toggled = false;
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             section_label(ui, "Protection");
@@ -776,6 +809,8 @@ impl App {
             ui.separator();
             changed |= toggle_row(ui, "Scan programs when they start", "Check every program and script you run, and scripts as soon as they are saved in your folders.", &mut c.watch_launches);
             ui.separator();
+            admin_toggled = toggle_row(ui, "Admin mode", admin_desc, &mut admin_on);
+            ui.separator();
             changed |= toggle_row(
                 ui,
                 "Quarantine threats automatically",
@@ -787,6 +822,9 @@ impl App {
             ui.separator();
             changed |= toggle_row(ui, "Notify about suspicious files", "Files that look unusual but are not clearly malicious.", &mut c.notify_suspicious);
         });
+        if admin_toggled {
+            self.change_admin_mode(admin_on);
+        }
         if changed {
             self.update_config(|cfg| {
                 cfg.watch_downloads = c.watch_downloads;

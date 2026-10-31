@@ -80,6 +80,9 @@ pub struct Status {
     pub rules: usize,
     pub watched: Vec<WatchedDir>,
     pub current: Option<String>,
+    /// Admin mode's helper is connected and reporting program starts.
+    #[serde(default)]
+    pub admin_mode: bool,
 }
 
 impl Status {

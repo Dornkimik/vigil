@@ -14,15 +14,20 @@
 //! right here rather than behind the worker's queue, along with the script file they are
 //! told to run.
 //!
+//! In admin mode a helper running as SYSTEM reports every program the moment it starts
+//! (see `admin`), and polling stays at once a second as a safety net.
+//!
 //! Each program is also reported with its process ID, so its memory can be checked
 //! once it has had time to unpack itself.
 
 use super::{Shared, Work};
+use crate::admin;
 use crate::engine::{cmdline, filetype};
 use crate::winapi;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -35,32 +40,67 @@ const BURST: Duration = Duration::from_secs(5);
 /// Windows programs that run code from a DLL named on their command line.
 const DLL_HOSTS: &[&str] = &["rundll32.exe", "regsvr32.exe"];
 
-/// Asks the process watcher to poll fast for a while, and wakes it up to start now.
+/// What gets the process watcher going before its next poll: a burst of fast polling (a
+/// script host started, or a script was saved), and the processes admin mode reports.
 pub(crate) struct Burst {
-    until: Mutex<Instant>,
+    signals: Mutex<Signals>,
     wake: Condvar,
+    /// Admin mode's helper is connected. Every start is reported then, so polling stays slow.
+    pub events: AtomicBool,
+}
+
+struct Signals {
+    until: Instant,
+    started: Vec<u32>,
 }
 
 impl Burst {
     pub fn new() -> Self {
-        Self { until: Mutex::new(Instant::now()), wake: Condvar::new() }
+        Self { signals: Mutex::new(Signals { until: Instant::now(), started: Vec::new() }), wake: Condvar::new(), events: AtomicBool::new(false) }
     }
 
     pub fn start(&self) {
-        *self.until.lock().unwrap() = Instant::now() + BURST;
+        self.signals.lock().unwrap().until = Instant::now() + BURST;
         self.wake.notify_all();
     }
 
-    /// Waits until the next poll is due.
-    fn sleep(&self) {
-        let until = self.until.lock().unwrap();
-        if Instant::now() < *until {
-            drop(until);
-            thread::sleep(FAST_POLL);
-            return;
+    /// Processes admin mode reported as they started.
+    fn started(&self, pids: Vec<u32>) {
+        self.signals.lock().unwrap().started.extend(pids);
+        self.wake.notify_all();
+    }
+
+    /// How long polls are apart now.
+    fn interval(&self) -> Duration {
+        let fast = !self.events.load(Ordering::Relaxed) && Instant::now() < self.signals.lock().unwrap().until;
+        if fast { FAST_POLL } else { POLL }
+    }
+
+    /// Waits until `deadline`, a burst begins or processes are reported, and returns those.
+    fn wait(&self, deadline: Instant) -> Vec<u32> {
+        let signals = self.signals.lock().unwrap();
+        let idle = signals.until;
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        let (mut signals, _) = self.wake.wait_timeout_while(signals, timeout, |s| s.started.is_empty() && s.until == idle).unwrap();
+        std::mem::take(&mut signals.started)
+    }
+}
+
+/// Reads admin mode's process-start events while its helper runs (see `admin`).
+pub fn listen(shared: Arc<Shared>) {
+    loop {
+        if admin::installed()
+            && let Some(mut events) = admin::Events::connect()
+        {
+            shared.burst.events.store(true, Ordering::Relaxed);
+            while let Some(pids) = events.next() {
+                if !pids.is_empty() {
+                    shared.burst.started(pids);
+                }
+            }
+            shared.burst.events.store(false, Ordering::Relaxed);
         }
-        let idle = *until;
-        let _ = self.wake.wait_timeout_while(until, POLL, |u| *u == idle);
+        thread::sleep(Duration::from_secs(5));
     }
 }
 
@@ -73,36 +113,32 @@ pub fn run(shared: Arc<Shared>, tx: Sender<Work>) {
     // Running DLL hosts and the modules already queued for each.
     let mut hosts: HashMap<u32, HashSet<PathBuf>> = HashMap::new();
     let mut modules_checked = Instant::now();
+    let mut last_poll = Instant::now() - POLL;
     loop {
+        let reported = shared.burst.wait(last_poll + shared.burst.interval());
         let enabled = {
             let cfg = shared.config.read().unwrap();
             cfg.watch_launches && !cfg.paused
         };
-        if enabled {
+        if !enabled {
+            // Whatever started meanwhile gets scanned once protection is back on.
+            known.clear();
+            hosts.clear();
+            last_poll = Instant::now();
+            continue;
+        }
+        let mut queue = Vec::new();
+        // Reported by admin mode the moment they started; polling is the safety net.
+        for pid in reported {
+            if known.insert(pid) {
+                inspect(&shared, pid, &system_root, own_exe.as_deref(), &mut hosts, &mut queue);
+            }
+        }
+        if last_poll.elapsed() >= shared.burst.interval() {
+            last_poll = Instant::now();
             let current: HashSet<u32> = winapi::process_ids().into_iter().collect();
-            let mut queue = Vec::new();
             for &pid in current.difference(&known) {
-                let Some(image) = winapi::process_image(pid).map(long_path) else { continue };
-                if is_dll_host(&image) {
-                    // The command line still names the DLL if the host exits before it is inspected.
-                    let named = winapi::process_args(pid).map(|args| hosted_dlls(&image, &args)).unwrap_or_default();
-                    let named: HashSet<PathBuf> = named.into_iter().map(long_path).collect();
-                    queue.extend(named.iter().filter(|dll| !is_system(dll, &system_root)).cloned().map(Work::Launched));
-                    hosts.insert(pid, named);
-                }
-                if cmdline::is_script_host(&image)
-                    && let Some(line) = winapi::process_command_line(pid)
-                {
-                    shared.burst.start();
-                    let script = cmdline::script_file(&image, &winapi::split_args(&line)).map(long_path);
-                    queue.extend(script.filter(|s| !is_system(s, &system_root)).map(Work::Launched));
-                    super::check_command(&shared, pid, &image, &line);
-                }
-                if is_system(&image, &system_root) || own_exe.as_ref().is_some_and(|e| e.as_os_str().eq_ignore_ascii_case(image.as_os_str())) {
-                    continue;
-                }
-                queue.push(Work::Launched(image.clone()));
-                queue.push(Work::Started(pid, image));
+                inspect(&shared, pid, &system_root, own_exe.as_deref(), &mut hosts, &mut queue);
             }
             // DLLs load after the host starts, so hosts are re-checked while they run, at the
             // normal pace: listing a process's modules costs far more than listing processes.
@@ -118,19 +154,40 @@ pub fn run(shared: Arc<Shared>, tx: Sender<Work>) {
                     }
                 }
             }
-            for work in queue {
-                if tx.send(work).is_err() {
-                    return;
-                }
-            }
             known = current;
-        } else {
-            // Whatever started meanwhile gets scanned once protection is back on.
-            known.clear();
-            hosts.clear();
         }
-        shared.burst.sleep();
+        for work in queue {
+            if tx.send(work).is_err() {
+                return;
+            }
+        }
     }
+}
+
+/// Checks a process that just started: scans a script host's command line right away and
+/// queues the program's file, the DLL a DLL host runs and the script a script host runs.
+fn inspect(shared: &Shared, pid: u32, system_root: &str, own_exe: Option<&Path>, hosts: &mut HashMap<u32, HashSet<PathBuf>>, queue: &mut Vec<Work>) {
+    let Some(image) = winapi::process_image(pid).map(long_path) else { return };
+    if is_dll_host(&image) {
+        // The command line still names the DLL if the host exits before it is inspected.
+        let named = winapi::process_args(pid).map(|args| hosted_dlls(&image, &args)).unwrap_or_default();
+        let named: HashSet<PathBuf> = named.into_iter().map(long_path).collect();
+        queue.extend(named.iter().filter(|dll| !is_system(dll, system_root)).cloned().map(Work::Launched));
+        hosts.insert(pid, named);
+    }
+    if cmdline::is_script_host(&image)
+        && let Some(line) = winapi::process_command_line(pid)
+    {
+        shared.burst.start();
+        let script = cmdline::script_file(&image, &winapi::split_args(&line)).map(long_path);
+        queue.extend(script.filter(|s| !is_system(s, system_root)).map(Work::Launched));
+        super::check_command(shared, pid, &image, &line);
+    }
+    if is_system(&image, system_root) || own_exe.is_some_and(|e| e.as_os_str().eq_ignore_ascii_case(image.as_os_str())) {
+        return;
+    }
+    queue.push(Work::Launched(image.clone()));
+    queue.push(Work::Started(pid, image));
 }
 
 /// Programs under %SystemRoot% are Windows' own, apart from folders standard users can write to.

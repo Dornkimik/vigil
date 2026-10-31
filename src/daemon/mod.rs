@@ -92,6 +92,10 @@ pub fn run(open_gui: bool) {
         let (shared, tx) = (shared.clone(), tx.clone());
         thread::spawn(move || procwatch::run(shared, tx));
     }
+    {
+        let shared = shared.clone();
+        thread::spawn(move || procwatch::listen(shared));
+    }
     queue_recent_downloads(&tx);
 
     tray::run(shared.clone(), tx);
@@ -228,6 +232,7 @@ fn supervisor(shared: Arc<Shared>, tx: Sender<Work>) {
             rules: shared.engine.read().unwrap().rule_count(),
             watched: dirs.clone(),
             current: shared.current.lock().unwrap().clone(),
+            admin_mode: shared.burst.events.load(Ordering::Relaxed),
         }
         .save();
         thread::sleep(Duration::from_secs(2));

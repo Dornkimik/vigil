@@ -150,6 +150,31 @@ the next five seconds. PowerShell needs about 110 ms after it starts before it r
 of its command, so a hidden PowerShell started by a freshly written script is stopped before it
 runs anything: in testing, 40 to 80 ms after it started, every time.
 
+### Admin mode (optional)
+
+Windows only tells administrators the moment a program starts, so without admin rights Vigil
+has to look for new programs (once a second, or every 50 ms around script activity). Admin mode,
+in Settings or with `vigil.exe --admin-mode on`, asks for admin approval once and then removes
+that wait for every program, including commands started directly by a Run key, a scheduled task
+or another program:
+
+- A small helper (`vigil.exe --process-events`) runs as SYSTEM, started at boot by the scheduled
+  task `\Vigil\Process events`. It listens to Windows' process-start events (ETW,
+  Microsoft-Windows-Kernel-Process) and writes each new process ID to the pipe
+  `\\.\pipe\Vigil.ProcessEvents`. That is all it does: the pipe only carries data out of it, so
+  nothing can send it input, and it never opens a file.
+- Scanning stays in the normal Vigil without admin rights, so a bug in a file parser can't hand
+  malware admin rights. Vigil only accepts the pipe from a process in session 0, where services and
+  SYSTEM tasks run, so a program in your session can't pose as the helper.
+- The task runs a copy of `vigil.exe` in `C:\Program Files\Vigil\`, which only administrators can
+  change. Pointing it at `vigil.exe` wherever you keep it would let anything that can write there
+  run as SYSTEM. Turning admin mode on again updates the copy.
+- Polling stays on at once a second as a safety net, and fast polling isn't needed while the helper
+  is connected.
+
+Admin mode still can't stop programs that run as administrator, or read their memory: Vigil
+itself doesn't have admin rights. `vigil.exe --admin-mode off` removes the task and the copy.
+
 The rules are obfuscated at build time (`build.rs`), so `vigil.exe` does not contain the
 plaintext malware indicators. Otherwise Defender or Vigil itself could flag it.
 
@@ -181,6 +206,7 @@ This starts the background service and opens the dashboard. In the dashboard, go
 | `vigil.exe --scan <paths…> [--fast] [--json] [--out file]` | Command-line scan. Exit code 0 = clean, 1 = suspicious, 2 = malicious, 3 = nothing flagged but a path or file could not be scanned |
 | `vigil.exe --update-hashes` | Download the MalwareBazaar hash database now (needs the Auth-Key) |
 | `vigil.exe --update-yara` | Download and compile the YARA Forge rules now |
+| `vigil.exe --admin-mode on\|off` | Turn admin mode on or off (asks for admin approval) |
 
 Tray icon: left-click opens the dashboard. Right-click shows *Scan Downloads now*,
 *Pause protection* and *Exit*. Files that arrive while protection is paused are scanned once it
@@ -259,7 +285,7 @@ and [MITRE ATT&CK obfuscation techniques](https://attack.mitre.org/techniques/T1
   can be missed. Fast polling narrows that to 50 ms around script activity, but only after a
   script was saved in a user folder or a script host was seen: a command started directly by
   another program (a Run key, a scheduled task, a dropper's own process) can still run for up to
-  a second before it is checked. A check costs about 5 ms of CPU, so during those five seconds of
+  a second before it is checked, unless admin mode is on. A check costs about 5 ms of CPU, so during those five seconds of
   fast polling Vigil uses about a tenth of one core. Programs running as administrator cannot be
   stopped; Vigil notifies you instead.
   DLLs are only checked for `rundll32.exe` and `regsvr32.exe`, and only under those names:

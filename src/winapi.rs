@@ -25,7 +25,9 @@ use windows_sys::Win32::System::Memory::{
 };
 use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::System::Threading::*;
-use windows_sys::Win32::UI::Shell::CommandLineToArgvW;
+use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+use windows_sys::Win32::UI::Shell::{CommandLineToArgvW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
+use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -520,6 +522,46 @@ pub fn stop_process(pid: u32, command_line: &str) -> Option<bool> {
         let stopped = can_stop && TerminateProcess(h, 1) != 0 && WaitForSingleObject(h, 5000) == WAIT_OBJECT_0;
         CloseHandle(h);
         Some(stop_descendants(pid, created) && stopped)
+    }
+}
+
+/// Whether this process runs with admin rights (elevated).
+pub fn is_elevated() -> bool {
+    unsafe {
+        let mut token = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut len = 0;
+        let ok = GetTokenInformation(token, TokenElevation, (&raw mut elevation).cast(), size_of::<TOKEN_ELEVATION>() as u32, &mut len) != 0;
+        CloseHandle(token);
+        ok && elevation.TokenIsElevated != 0
+    }
+}
+
+/// Runs this program again with admin rights (a UAC prompt), waits for it and returns its
+/// exit code. `None` when the user declined.
+pub fn run_elevated(args: &[&str]) -> Option<u32> {
+    let exe = wide(std::env::current_exe().ok()?);
+    let params = wide(args.join(" "));
+    let verb = wide("runas");
+    unsafe {
+        let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+        info.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_NOCLOSEPROCESS;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = exe.as_ptr();
+        info.lpParameters = params.as_ptr();
+        info.nShow = SW_HIDE;
+        if ShellExecuteExW(&mut info) == 0 || info.hProcess.is_null() {
+            return None;
+        }
+        WaitForSingleObject(info.hProcess, INFINITE);
+        let mut code = 1;
+        GetExitCodeProcess(info.hProcess, &mut code);
+        CloseHandle(info.hProcess);
+        Some(code)
     }
 }
 
