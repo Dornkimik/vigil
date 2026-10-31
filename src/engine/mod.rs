@@ -72,6 +72,7 @@ pub enum Source {
     Workshop,
     Folder,
     Manual,
+    Launch,
 }
 
 impl Source {
@@ -82,6 +83,7 @@ impl Source {
             Source::Workshop => "Steam Workshop",
             Source::Folder => "Watched folder",
             Source::Manual => "Manual scan",
+            Source::Launch => "Program started",
         }
     }
 }

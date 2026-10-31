@@ -1,6 +1,7 @@
 //! The background service: watches Downloads, Steam libraries and custom folders,
-//! scans new files on a low-priority thread and reacts to detections.
+//! scans new files and newly started programs on a low-priority thread and reacts to detections.
 
+mod procwatch;
 pub mod tray;
 
 use crate::config::{self, Config};
@@ -38,6 +39,8 @@ pub enum Work {
     Changed(PathBuf, Source),
     /// An explicit request to (re)scan a file or folder, ignoring the scan cache.
     Scan(PathBuf, Source),
+    /// The image of a program that just started. Scanned right away, ahead of other work.
+    Launched(PathBuf),
 }
 
 pub fn run(open_gui: bool) {
@@ -70,6 +73,10 @@ pub fn run(open_gui: bool) {
     {
         let shared = shared.clone();
         thread::spawn(move || signature_updater(shared));
+    }
+    {
+        let (shared, tx) = (shared.clone(), tx.clone());
+        thread::spawn(move || procwatch::run(shared, tx));
     }
     queue_recent_downloads(&tx);
 
@@ -197,10 +204,13 @@ struct Pending {
     due: Instant,
     attempts: u32,
     force: bool,
+    /// The file is the image of a running program, which gets stopped if it is malicious.
+    launched: bool,
 }
 
 struct Worker {
     shared: Arc<Shared>,
+    rx: Receiver<Work>,
     pending: HashMap<PathBuf, Pending>,
     /// path -> (size, mtime) of files already scanned, so Steam's churn doesn't trigger rescans.
     seen: HashMap<PathBuf, (u64, Option<SystemTime>)>,
@@ -209,14 +219,14 @@ struct Worker {
 
 fn worker(shared: Arc<Shared>, rx: Receiver<Work>) {
     winapi::set_background_priority();
-    let mut w = Worker { shared, pending: HashMap::new(), seen: HashMap::new(), data_dir: config::data_dir() };
+    let mut w = Worker { shared, rx, pending: HashMap::new(), seen: HashMap::new(), data_dir: config::data_dir() };
     loop {
-        match rx.recv_timeout(Duration::from_millis(500)) {
+        match w.rx.recv_timeout(Duration::from_millis(500)) {
             Ok(work) => w.enqueue(work),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return,
         }
-        while let Ok(work) = rx.try_recv() {
+        while let Ok(work) = w.rx.try_recv() {
             w.enqueue(work);
         }
         w.shared.queued.store(w.pending.len(), Ordering::Relaxed);
@@ -224,11 +234,13 @@ fn worker(shared: Arc<Shared>, rx: Receiver<Work>) {
         let now = Instant::now();
         let ready: Vec<PathBuf> = w.pending.iter().filter(|(_, p)| p.due <= now).map(|(k, _)| k.clone()).take(256).collect();
         for path in ready {
-            let p = w.pending.remove(&path).unwrap();
+            // Already taken by `scan_launches` during this batch.
+            let Some(p) = w.pending.remove(&path) else { continue };
             if w.shared.config.read().unwrap().paused {
                 continue;
             }
             w.process(&path, p);
+            w.scan_launches();
         }
         if w.pending.is_empty() {
             *w.shared.current.lock().unwrap() = None;
@@ -241,17 +253,38 @@ fn worker(shared: Arc<Shared>, rx: Receiver<Work>) {
 
 impl Worker {
     fn enqueue(&mut self, work: Work) {
-        let (path, source, force) = match work {
-            Work::Changed(p, s) => (p, s, false),
-            Work::Scan(p, s) => (p, s, true),
+        let (path, source, force, launched) = match work {
+            Work::Changed(p, s) => (p, s, false, false),
+            Work::Scan(p, s) => (p, s, true, false),
+            Work::Launched(p) => (p, Source::Launch, false, true),
         };
         if path.starts_with(&self.data_dir) || TEMP_EXTS.contains(&ext_of(&path.to_string_lossy()).as_str()) {
             return;
         }
-        let due = Instant::now() + if force { Duration::ZERO } else { SETTLE };
-        let entry = self.pending.entry(path).or_insert(Pending { source, due, attempts: 0, force });
+        // A finished download or a running program won't change any more; no need to let it settle.
+        let due = Instant::now() + if force || launched { Duration::ZERO } else { SETTLE };
+        let entry = self.pending.entry(path).or_insert(Pending { source, due, attempts: 0, force, launched });
         entry.due = due;
         entry.force |= force;
+        entry.launched |= launched;
+    }
+
+    /// Picks up new work and scans programs that just started right away, so a big
+    /// folder scan or Steam install doesn't hold them up.
+    fn scan_launches(&mut self) {
+        while let Ok(work) = self.rx.try_recv() {
+            self.enqueue(work);
+        }
+        if self.shared.config.read().unwrap().paused {
+            return;
+        }
+        let now = Instant::now();
+        let due: Vec<PathBuf> = self.pending.iter().filter(|(_, p)| p.launched && p.due <= now).map(|(k, _)| k.clone()).collect();
+        for path in due {
+            if let Some(p) = self.pending.remove(&path) {
+                self.process(&path, p);
+            }
+        }
     }
 
     fn process(&mut self, path: &Path, p: Pending) {
@@ -266,13 +299,14 @@ impl Worker {
                         if self.shared.config.read().unwrap().paused {
                             return;
                         }
-                        let _ = self.scan_one(&entry.path(), p.source, p.force);
+                        let _ = self.scan_one(&entry.path(), p.source, p.force, false);
+                        self.scan_launches();
                     }
                 }
             }
             return;
         }
-        if let Err(e) = self.scan_one(path, p.source, p.force) {
+        if let Err(e) = self.scan_one(path, p.source, p.force, p.launched) {
             // Locked by the writer (sharing violation / access denied): try again shortly.
             let retry = matches!(e.raw_os_error(), Some(32) | Some(33) | Some(5));
             if retry && p.attempts < MAX_RETRIES {
@@ -284,7 +318,7 @@ impl Worker {
         }
     }
 
-    fn scan_one(&mut self, path: &Path, source: Source, force: bool) -> std::io::Result<()> {
+    fn scan_one(&mut self, path: &Path, source: Source, force: bool, launched: bool) -> std::io::Result<()> {
         let meta = std::fs::metadata(path)?;
         if !meta.is_file() || meta.len() == 0 {
             return Ok(());
@@ -302,20 +336,31 @@ impl Worker {
         self.seen.insert(path.to_path_buf(), key);
         if report.analyzed {
             self.shared.scanned.fetch_add(1, Ordering::Relaxed);
-            handle_report(&self.shared, report, source);
+            handle_report(&self.shared, report, source, launched);
         }
         Ok(())
     }
 }
 
-fn handle_report(shared: &Shared, report: Report, source: Source) {
+fn handle_report(shared: &Shared, report: Report, source: Source, launched: bool) {
     let cfg = shared.config.read().unwrap().clone();
     let mut action = Action::None;
     if report.verdict >= Verdict::Suspicious {
         shared.threats.fetch_add(1, Ordering::Relaxed);
     }
     if report.verdict == Verdict::Malicious && cfg.auto_quarantine {
-        action = match store::quarantine(&report) {
+        // A running program locks its file, so it has to be stopped before it can be moved.
+        let stopped = launched && winapi::terminate_image(&report.path);
+        let mut result = store::quarantine(&report);
+        // The image can stay mapped for a moment after the process exits.
+        for _ in 0..5 {
+            if result.is_ok() || !stopped {
+                break;
+            }
+            thread::sleep(Duration::from_millis(300));
+            result = store::quarantine(&report);
+        }
+        action = match result {
             Ok(_) => Action::Quarantined,
             Err(_) => Action::QuarantineFailed,
         };
@@ -324,7 +369,15 @@ fn handle_report(shared: &Shared, report: Report, source: Source) {
     let reason = report.findings.iter().filter(|f| f.weight > 0).max_by_key(|f| f.weight).map(|f| f.title.as_str()).unwrap_or("");
     if cfg.notifications {
         let note = match (report.verdict, action) {
+            (Verdict::Malicious, Action::Quarantined) if launched => {
+                Some(("Threat stopped and quarantined", format!("{}\n{reason}", report.name), true))
+            }
             (Verdict::Malicious, Action::Quarantined) => Some(("Threat quarantined", format!("{}\n{reason}", report.name), true)),
+            (Verdict::Malicious, Action::QuarantineFailed) if launched => Some((
+                "Threat detected - action needed",
+                format!("{} is running and could not be stopped or quarantined.", report.name),
+                true,
+            )),
             (Verdict::Malicious, Action::QuarantineFailed) => {
                 Some(("Threat detected - action needed", format!("{} is in use and could not be quarantined.", report.name), true))
             }
@@ -337,8 +390,8 @@ fn handle_report(shared: &Shared, report: Report, source: Source) {
         }
     }
 
-    // Steam installs produce thousands of clean files; only log what matters there.
-    let noisy = matches!(source, Source::Steam | Source::Workshop);
+    // Steam installs and everyday program launches produce lots of clean files; only log what matters there.
+    let noisy = matches!(source, Source::Steam | Source::Workshop | Source::Launch);
     if !noisy || report.verdict != Verdict::Clean {
         store::append_event(&Event { time: store::now(), source, action, report });
     }

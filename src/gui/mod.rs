@@ -731,7 +731,14 @@ impl App {
             };
             changed |= toggle_row(ui, "Watch Steam libraries", &steam_desc, &mut c.watch_steam);
             ui.separator();
-            changed |= toggle_row(ui, "Quarantine threats automatically", "Malicious files are moved to quarantine immediately.", &mut c.auto_quarantine);
+            changed |= toggle_row(ui, "Scan programs when they start", "Check every program you run, wherever it is stored.", &mut c.watch_launches);
+            ui.separator();
+            changed |= toggle_row(
+                ui,
+                "Quarantine threats automatically",
+                "Malicious files are moved to quarantine immediately. Malicious programs that are running are stopped first.",
+                &mut c.auto_quarantine,
+            );
             ui.separator();
             changed |= toggle_row(ui, "Notifications", "Show a notification when something is found.", &mut c.notifications);
             ui.separator();
@@ -741,6 +748,7 @@ impl App {
             self.update_config(|cfg| {
                 cfg.watch_downloads = c.watch_downloads;
                 cfg.watch_steam = c.watch_steam;
+                cfg.watch_launches = c.watch_launches;
                 cfg.auto_quarantine = c.auto_quarantine;
                 cfg.notifications = c.notifications;
                 cfg.notify_suspicious = c.notify_suspicious;

@@ -40,6 +40,8 @@ pub struct Config {
     pub watch_downloads: bool,
     pub watch_steam: bool,
     pub extra_folders: Vec<PathBuf>,
+    /// Scan the program file of every process that starts (outside the Windows folder).
+    pub watch_launches: bool,
     /// Move files with a "malicious" verdict to quarantine automatically.
     pub auto_quarantine: bool,
     pub notify_suspicious: bool,
@@ -57,6 +59,7 @@ impl Default for Config {
             watch_downloads: true,
             watch_steam: true,
             extra_folders: Vec::new(),
+            watch_launches: true,
             auto_quarantine: true,
             notify_suspicious: true,
             notifications: true,

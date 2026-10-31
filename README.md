@@ -2,12 +2,15 @@
 
 A lightweight background malware scanner for Windows 11, written in Rust. It is a
 **supplement to Microsoft Defender**, not a replacement, and it covers two common ways
-malware gets onto a gaming PC:
+malware gets onto a gaming PC, plus a safety net for programs that arrive any other way:
 
 - **Browser downloads**: new files in your Downloads folder are checked as soon as the
   browser finishes writing them.
 - **Steam games and the Workshop**: game installs, updates and Workshop items are checked
   as Steam writes them (for example, indie games that ship an info-stealer).
+- **Programs you run**: every program that starts is checked once, wherever it is stored
+  (a USB stick, an archive extracted to `%TEMP%`, a file another program dropped). Programs
+  in the Windows folder are skipped.
 
 ## How it works
 
@@ -15,7 +18,7 @@ Vigil runs as two parts of one small executable:
 
 | Part | What it does | Footprint |
 |---|---|---|
-| Background service (`--background`) | Tray icon, folder watchers, scanning on a low-priority (background I/O) thread | A few MB of RAM, idle when nothing changes |
+| Background service (`--background`) | Tray icon, folder watchers, program-start watcher, scanning on a low-priority (background I/O) thread | A few MB of RAM, idle when nothing changes |
 | Dashboard (`--gui`) | Status, manual scans, activity log, quarantine and settings | Runs only while the window is open |
 
 When you close the dashboard, protection keeps running in the notification area.
@@ -70,8 +73,9 @@ shows every finding that added to the score.
 8. **Defender cross-check**: the *Ask Defender* button sends a single file to
    `MpCmdRun.exe` for a second opinion. Defender does not remediate during this check.
 
-Malicious files are quarantined automatically (configurable). Suspicious files only trigger a
-notification. Quarantined files are XOR-encoded in `%LOCALAPPDATA%\Vigil\quarantine` so they
+Malicious files are quarantined automatically (configurable). If the file is a program that is
+running, Vigil stops every process running it first, since Windows locks a running program's file.
+Suspicious files only trigger a notification. Quarantined files are XOR-encoded in `%LOCALAPPDATA%\Vigil\quarantine` so they
 can't run by accident. Restoring a file also marks it as safe.
 
 The rules are obfuscated at build time (`build.rs`), so `vigil.exe` does not contain the
@@ -156,6 +160,11 @@ and [MITRE ATT&CK obfuscation techniques](https://attack.mitre.org/techniques/T1
 
 ## Limitations
 
+- The program-start check is a static scan of the program file when it starts, not runtime
+  behavior monitoring. Vigil checks the process list once a second without admin rights, so the
+  program is already running when it is scanned, and one that starts and exits within a second
+  can be missed. Programs running as administrator cannot be stopped; Vigil notifies you instead.
+
 - Static heuristics cannot determine intent or observe runtime behavior. Custom encryption,
   runtime-built strings, arbitrary character-code expressions, native packers, and payloads
   beyond the recovery limits can get through. Script recovery is not a complete language
@@ -175,7 +184,7 @@ rules/default.rules   detection rules (obfuscated into the binary at build time)
 build.rs              rule obfuscation + generated .ico embedding
 src/engine/           scanner: rules, PE analysis, ZIP inspection, file-type heuristics,
                       offline MalwareBazaar hash database (hashdb.rs)
-src/daemon/           background service: watchers, debounced worker, Win32 tray
+src/daemon/           background service: watchers, program-start watcher, debounced worker, Win32 tray
 src/gui/              egui dashboard and theme
 src/store.rs          activity log, status heartbeat, quarantine vault
 src/winapi.rs         Authenticode, Mark-of-the-Web, registry, Defender (MpCmdRun)

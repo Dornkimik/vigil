@@ -1,7 +1,7 @@
 //! Thin wrappers around the Win32 APIs Vigil needs.
 
-use std::ffi::{OsStr, c_void};
-use std::os::windows::ffi::OsStrExt;
+use std::ffi::{OsStr, OsString, c_void};
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,6 +11,9 @@ use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::Cryptography::{CERT_NAME_SIMPLE_DISPLAY_TYPE, CertGetNameStringW};
 use windows_sys::Win32::Security::WinTrust::*;
 use windows_sys::Win32::System::Console::{ATTACH_PARENT_PROCESS, AttachConsole};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
 use windows_sys::Win32::System::Registry::*;
 use windows_sys::Win32::System::Threading::*;
 
@@ -140,6 +143,67 @@ pub fn set_background_priority() {
     unsafe {
         SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
     }
+}
+
+/// IDs of all running processes.
+pub fn process_ids() -> Vec<u32> {
+    let mut ids = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return ids;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snap, &mut entry);
+        while ok != 0 {
+            ids.push(entry.th32ProcessID);
+            ok = Process32NextW(snap, &mut entry);
+        }
+        CloseHandle(snap);
+    }
+    ids
+}
+
+unsafe fn image_of(process: HANDLE) -> Option<PathBuf> {
+    let mut buf = vec![0u16; 32768];
+    let mut len = buf.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) };
+    (ok != 0).then(|| PathBuf::from(OsString::from_wide(&buf[..len as usize])))
+}
+
+/// Full path of the program a process runs. `None` for processes we may not query
+/// (System, protected processes) or that already exited.
+pub fn process_image(pid: u32) -> Option<PathBuf> {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let image = image_of(h);
+        CloseHandle(h);
+        image
+    }
+}
+
+/// Ends every process running `image`, matching by path rather than PID so a reused
+/// PID never hits an unrelated program. Returns false if one of them could not be stopped.
+/// Processes we cannot open (elevated ones) are skipped; quarantine then fails visibly.
+pub fn terminate_image(image: &Path) -> bool {
+    let mut all = true;
+    for pid in process_ids() {
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid);
+            if h.is_null() {
+                continue;
+            }
+            if image_of(h).is_some_and(|p| p.as_os_str().eq_ignore_ascii_case(image.as_os_str())) {
+                all &= TerminateProcess(h, 1) != 0 && WaitForSingleObject(h, 5000) == WAIT_OBJECT_0;
+            }
+            CloseHandle(h);
+        }
+    }
+    all
 }
 
 pub struct NamedMutex(HANDLE);
