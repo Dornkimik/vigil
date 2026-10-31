@@ -117,6 +117,17 @@ The [technical reference](docs/TECHNICAL.md) covers every detection layer and it
 admin mode internals, command-line scanning, writing your own rules, the test suite, the full
 list of limitations and the project layout.
 
+## AI disclosure
+
+Vigil was developed with substantial assistance from AI coding tools, including Anthropic's
+Claude, which helped write its code, detection rules and documentation. Commits in the project
+history that were made with AI assistance carry a `Co-Authored-By` line naming the model.
+
+As with any security software, the source code is open for you to review, and Vigil has not
+been independently audited. It is provided "as is", without warranty of any kind, as set out in
+the [license](LICENSE). If you find a bug, a false alarm or a missed detection, please
+[open an issue](https://github.com/Dornkimik/vigil/issues).
+
 ## License
 
 [MIT](LICENSE)
