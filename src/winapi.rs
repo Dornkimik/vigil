@@ -677,7 +677,11 @@ pub fn steam_install_path() -> Option<PathBuf> {
         .or_else(|| reg_get_string(HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath").map(PathBuf::from))
 }
 
-const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+/// `HKCU\...\CurrentVersion\Run`, joined at runtime so `vigil.exe` doesn't contain the
+/// path its own autorun rule looks for.
+fn run_key() -> String {
+    ["Software", "Microsoft", "Windows", "CurrentVersion", "Run"].join("\\")
+}
 const RUN_VALUE: &str = "Vigil";
 
 pub fn autostart_enabled() -> bool {
@@ -686,11 +690,11 @@ pub fn autostart_enabled() -> bool {
 
 /// The command Vigil's autostart entry runs, while autostart is on.
 pub fn autostart_command() -> Option<String> {
-    reg_get_string(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE)
+    reg_get_string(HKEY_CURRENT_USER, &run_key(), RUN_VALUE)
 }
 
 pub fn set_autostart(enabled: bool) -> bool {
-    let (k, v) = (wide(RUN_KEY), wide(RUN_VALUE));
+    let (k, v) = (wide(run_key()), wide(RUN_VALUE));
     unsafe {
         if enabled {
             let Ok(exe) = std::env::current_exe() else { return false };

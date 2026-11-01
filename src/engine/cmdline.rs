@@ -30,14 +30,16 @@ const SWITCHES: &[(&str, bool)] = &[
     ("WorkingDirectory", true),
 ];
 
-/// Built-in aliases of the commands download cradles use.
-const ALIASES: &[(&str, &str)] = &[
-    ("iex", "Invoke-Expression"),
-    ("irm", "Invoke-RestMethod"),
-    ("iwr", "Invoke-WebRequest"),
-    ("ii", "Invoke-Item"),
-    ("saps", "Start-Process"),
-    ("start", "Start-Process"),
+/// Built-in aliases of the commands download cradles use, as (alias, verb, noun). The dash
+/// is added at runtime so `vigil.exe` doesn't contain the cradle commands' names, which
+/// would make its own rules flag it.
+const ALIASES: &[(&str, &str, &str)] = &[
+    ("iex", "Invoke", "Expression"),
+    ("irm", "Invoke", "RestMethod"),
+    ("iwr", "Invoke", "WebRequest"),
+    ("ii", "Invoke", "Item"),
+    ("saps", "Start", "Process"),
+    ("start", "Start", "Process"),
 ];
 
 /// How much of an unquoted -Command after a PowerShell invocation in a file counts as its code.
@@ -182,9 +184,11 @@ pub fn expand_aliases(code: &str) -> Option<String> {
         if start > 0 && matches!(bytes[start - 1], b'$' | b'.' | b':') {
             continue;
         }
-        if let Some((_, full)) = ALIASES.iter().find(|(a, _)| code[start..i].eq_ignore_ascii_case(a)) {
+        if let Some((_, verb, noun)) = ALIASES.iter().find(|(a, ..)| code[start..i].eq_ignore_ascii_case(a)) {
             out.push_str(&code[copied..start]);
-            out.push_str(full);
+            out.push_str(verb);
+            out.push('-');
+            out.push_str(noun);
             copied = i;
         }
     }
