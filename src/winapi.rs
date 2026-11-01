@@ -28,7 +28,7 @@ use windows_sys::Win32::System::Threading::*;
 use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
 use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser};
 use windows_sys::Win32::UI::Shell::{CommandLineToArgvW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
-use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW, SW_HIDE};
 
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
@@ -636,6 +636,13 @@ impl Drop for NamedMutex {
 
 pub fn attach_parent_console() -> bool {
     unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 }
+}
+
+pub fn error_box(title: &str, text: &str) {
+    let (title, text) = (wide(title), wide(text));
+    unsafe {
+        MessageBoxW(null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONERROR);
+    }
 }
 
 pub fn spawn_self(args: &[&str]) {

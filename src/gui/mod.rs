@@ -34,7 +34,12 @@ pub fn run() {
             .with_icon(Arc::new(egui::IconData { rgba, width: 64, height: 64 })),
         ..Default::default()
     };
-    let _ = eframe::run_native(WINDOW_TITLE, options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx)))));
+    if let Err(e) = eframe::run_native(WINDOW_TITLE, options, Box::new(|cc| Ok(Box::new(App::new(&cc.egui_ctx))))) {
+        winapi::error_box(
+            WINDOW_TITLE,
+            &format!("The dashboard could not be opened: {e}\n\nProtection keeps running in the notification area."),
+        );
+    }
 }
 
 /// Brings an already open dashboard to the front. Returns false if none is open.
