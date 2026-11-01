@@ -204,7 +204,8 @@ Requirements: Rust (stable, MSVC toolchain) on Windows 10/11.
 cargo build --release
 ```
 
-The binary is `target\release\vigil.exe` (about 8 MB, no installer or runtime needed).
+The binary is `target\release\vigil.exe` (about 25 MB, no installer or runtime needed). Prebuilt binaries are attached to each
+[GitHub release](https://github.com/Dornkimik/vigil/releases).
 
 ## Command-line usage
 
