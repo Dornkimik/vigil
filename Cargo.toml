@@ -1,6 +1,6 @@
 [package]
 name = "vigil"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Lightweight background malware scanner for downloads and Steam content - a supplement to Windows Defender"
 license = "MIT"
